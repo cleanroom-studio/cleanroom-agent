@@ -6,6 +6,7 @@ pub mod orchestrator;
 pub mod producer;
 pub mod consumer;
 pub mod naming;
+pub mod name_resolution;
 pub mod consistency;
 pub mod repo_scanner;
 pub mod module_partitioner;
