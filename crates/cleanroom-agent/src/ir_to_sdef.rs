@@ -213,6 +213,24 @@ impl SdefMapper {
             None => return entities,
         };
 
+        // Try tree-sitter parser first if we can read the file
+        if let Ok(content) = std::fs::read_to_string(&file.path) {
+            if let Some(lang) = &file.language {
+                if let Some(analysis) = crate::tree_sitter_parser::parse_file_with_ts(
+                    &file.path,
+                    &content,
+                    lang,
+                ) {
+                    info!("tree-sitter parsed '{}': {} entities, {} imports",
+                        file.relative_path.display(),
+                        analysis.entities.len(),
+                        analysis.imports.len());
+                    return analysis.entities;
+                }
+            }
+        }
+
+        // Fallback: use the existing regex-based analysis
         if stem == stem.to_lowercase() && !stem.contains('.') {
             entities.push(IrEntity::DataModel {
                 name: to_pascal_case(stem),

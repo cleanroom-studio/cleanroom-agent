@@ -24,3 +24,4 @@ regex.workspace = true
 glob.workspace = true
 ignore.workspace = true
 rusqlite.workspace = true
+tree-sitter.workspace = true

@@ -129,6 +129,20 @@
 
     "check_consistency": "Run consistency check (fast/full/deep)",
     "compute_fingerprints": "Recompute and store fingerprints",
+    "resolve_inconsistency": "Resolve an inconsistency using a specific strategy",
+    "get_inconsistency_report": "Get detailed inconsistency report for a document",
+
+    "lsp_initialize": "Initialize LSP server for a language (typescript/rust/python/go)",
+    "lsp_get_document_symbols": "Get document symbols from a file via LSP",
+    "lsp_get_type_info": "Get type information at a specific position",
+    "lsp_find_references": "Find all references of a symbol",
+    "lsp_get_diagnostics": "Get diagnostics (errors/warnings) for a file",
+    "lsp_get_hierarchy": "Get type hierarchy (parents/children) of a symbol",
+
+    "set_compatibility_mode": "Set compatibility mode (full/mixed/clean/custom) for a document",
+    "list_compat_layers": "List all compatibility layers for a document",
+    "get_compat_layer_detail": "Get details of a specific compatibility layer",
+    "ignore_compat_layer": "Mark a compatibility layer as resolved/ignored",
 
     "error_prefix": "Error: {0}"
   },

@@ -3,6 +3,7 @@
 pub mod rust_gen;
 pub mod typescript_gen;
 pub mod python_gen;
+pub mod templates;
 
 use sdef_core::{DataModel, InterfaceContract, ClassContract, FunctionSpec};
 

@@ -523,6 +523,8 @@ dependencies = [
  "chrono",
  "cleanroom-db",
  "cleanroom-i18n",
+ "cleanroom-lsp",
+ "futures",
  "rmcp",
  "rmcp-macros",
  "rusqlite",

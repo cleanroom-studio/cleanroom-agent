@@ -1,0 +1,76 @@
+{
+  "name": "multi-version-app",
+  "sdef_version": "1.0.0",
+  "description": "Multi-version app v2 — with breaking changes and compatibility layer",
+  "data_models": [
+    {
+      "entity": "User",
+      "status": "active",
+      "version": "2.0.0",
+      "description": "User account — renamed fields",
+      "attributes": [
+        {
+          "name": "id",
+          "attr_type": "UUID",
+          "required": true,
+          "identity": true
+        },
+        {
+          "name": "username",
+          "attr_type": "string",
+          "required": true
+        },
+        {
+          "name": "email_address",
+          "attr_type": "string",
+          "required": true,
+          "description": "Renamed from 'email' in v1"
+        },
+        {
+          "name": "display_name",
+          "attr_type": "string",
+          "required": false,
+          "description": "New field added in v2"
+        }
+      ]
+    },
+    {
+      "entity": "Task",
+      "status": "active",
+      "version": "1.0.0",
+      "description": "A task item — unchanged",
+      "attributes": [
+        {
+          "name": "id",
+          "attr_type": "UUID",
+          "required": true,
+          "identity": true
+        },
+        {
+          "name": "title",
+          "attr_type": "string",
+          "required": true
+        },
+        {
+          "name": "status",
+          "attr_type": "string",
+          "required": true
+        }
+      ]
+    }
+  ],
+  "version_records": [
+    {
+      "version": "1.0.0",
+      "release_date": "2024-01-15",
+      "deprecated": true,
+      "eol_date": "2024-06-30",
+      "breaking_changes": ["email → email_address", "New field: display_name"]
+    },
+    {
+      "version": "2.0.0",
+      "release_date": "2024-07-01",
+      "deprecated": false
+    }
+  ]
+}

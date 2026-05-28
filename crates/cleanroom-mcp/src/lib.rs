@@ -24,7 +24,7 @@ use cleanroom_db::{
     SdefRepository,
 };
 use cleanroom_db::repositories::{CheckpointRepository, Checkpoint};
-use cleanroom_lsp::{LspServerPool, LspServerHandle};
+use cleanroom_lsp::LspServerPool;
 
 fn tr(key: &str) -> String {
     cleanroom_i18n::global().translate(key)
@@ -133,12 +133,77 @@ impl CleanroomMcpServer {
         Ok(())
     }
 
+    // ============ Middleware Layer ============
+
+    /// Permission check: enforce that agents can only manage tasks they own.
+    fn check_permission(&self, tool_name: &str, args: &Value) -> Result<(), String> {
+        // Task mutation tools require agent_id to match assigned_to
+        let mutating_tasks = [
+            "claim_task", "complete_task", "fail_task", "send_heartbeat",
+            "update_task_progress",
+        ];
+        if mutating_tasks.contains(&tool_name) {
+            if let Some(agent_id) = args.get("agent_id").and_then(|v| v.as_str()) {
+                if let Some(task_id) = args.get("task_id").and_then(|v| v.as_str()) {
+                    let repo = self.task_repo();
+                    let task = repo.get(task_id).map_err(|e| e.to_string())?;
+                    if let Some(ref assigned) = task.assigned_to {
+                        if assigned != agent_id {
+                            return Err(format!(
+                                "Permission denied: task '{}' is assigned to '{}', not '{}'",
+                                task_id, assigned, agent_id
+                            ));
+                        }
+                    }
+                }
+            }
+            // Tools that need agent_id but don't have it
+            if tool_name == "claim_task" && args.get("agent_id").is_none() {
+                return Err("Permission denied: claim_task requires 'agent_id'".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Request logging: record all tool calls to tracing.
+    fn log_request(&self, tool_name: &str, args: &Value, result: &Result<Value, String>) {
+        match result {
+            Ok(val) => {
+                let summary = if val.is_object() {
+                    let keys: Vec<String> = val.as_object()
+                        .map(|o| o.keys().take(5).cloned().collect())
+                        .unwrap_or_default();
+                    format!("{{ {} keys }}", keys.join(", "))
+                } else {
+                    "non-object".to_string()
+                };
+                tracing::info!(
+                    tool = %tool_name,
+                    args = %serde_json::to_string(args).unwrap_or_default(),
+                    result_summary = %summary,
+                    "MCP tool call succeeded"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    tool = %tool_name,
+                    args = %serde_json::to_string(args).unwrap_or_default(),
+                    error = %err,
+                    "MCP tool call failed"
+                );
+            }
+        }
+    }
+
     // ============ Tool Dispatcher ============
 
     fn dispatch_tool_call(&self, request: rmcp::model::CallToolRequestParams) -> Result<Value, String> {
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
         let args_value = serde_json::to_value(&args).unwrap_or(json!({}));
+
+        // Permission check
+        self.check_permission(&name, &args_value)?;
 
         match name.as_str() {
             // Task Management
@@ -873,7 +938,15 @@ impl ServerHandler for CleanroomMcpServer {
         request: rmcp::model::CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + std::marker::Send + '_ {
+        let name = request.name.to_string();
+        let args = request.arguments.clone().unwrap_or_default();
+        let args_value = serde_json::to_value(&args).unwrap_or(json!({}));
+
         let result = self.dispatch_tool_call(request);
+
+        // Apply logging middleware (capture result for logging)
+        self.log_request(&name, &args_value, &result);
+
         async move {
             match result {
                 Ok(json_val) => {

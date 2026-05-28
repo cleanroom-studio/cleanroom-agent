@@ -1,0 +1,112 @@
+{
+  "name": "multi-version-app",
+  "sdef_version": "1.0.0",
+  "description": "Multi-version app v3 — added Profile, deprecated Task.status",
+  "data_models": [
+    {
+      "entity": "User",
+      "status": "active",
+      "version": "2.0.0",
+      "description": "User account",
+      "attributes": [
+        {
+          "name": "id",
+          "attr_type": "UUID",
+          "required": true,
+          "identity": true
+        },
+        {
+          "name": "username",
+          "attr_type": "string",
+          "required": true
+        },
+        {
+          "name": "email_address",
+          "attr_type": "string",
+          "required": true
+        },
+        {
+          "name": "display_name",
+          "attr_type": "string",
+          "required": false
+        }
+      ]
+    },
+    {
+      "entity": "Profile",
+      "status": "active",
+      "version": "1.0.0",
+      "description": "User profile — new in v3",
+      "attributes": [
+        {
+          "name": "id",
+          "attr_type": "UUID",
+          "required": true,
+          "identity": true
+        },
+        {
+          "name": "bio",
+          "attr_type": "string",
+          "required": false
+        },
+        {
+          "name": "avatar_url",
+          "attr_type": "string",
+          "required": false
+        }
+      ]
+    },
+    {
+      "entity": "Task",
+      "status": "active",
+      "version": "2.0.0",
+      "description": "A task item — status deprecated in favor of state",
+      "attributes": [
+        {
+          "name": "id",
+          "attr_type": "UUID",
+          "required": true,
+          "identity": true
+        },
+        {
+          "name": "title",
+          "attr_type": "string",
+          "required": true
+        },
+        {
+          "name": "status",
+          "attr_type": "string",
+          "required": true,
+          "deprecated": true
+        },
+        {
+          "name": "state",
+          "attr_type": "string",
+          "required": true,
+          "description": "Replaces deprecated 'status' field"
+        }
+      ]
+    }
+  ],
+  "version_records": [
+    {
+      "version": "1.0.0",
+      "release_date": "2024-01-15",
+      "deprecated": true,
+      "eol_date": "2024-06-30",
+      "breaking_changes": ["email → email_address"]
+    },
+    {
+      "version": "2.0.0",
+      "release_date": "2024-07-01",
+      "deprecated": true,
+      "eol_date": "2024-12-31",
+      "breaking_changes": ["status → state", "New entity: Profile"]
+    },
+    {
+      "version": "3.0.0",
+      "release_date": "2025-01-15",
+      "deprecated": false
+    }
+  ]
+}

@@ -6,11 +6,11 @@
 //! - Maximum concurrent server limit
 
 use std::collections::HashMap;
+use std::fmt;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lsp_server::{Connection, IoThreads};
 use lsp_types::ServerCapabilities;
 use tokio::process::{Child, Command};
 use tracing::{info, warn};
@@ -290,10 +290,7 @@ impl LspServerPool {
 
                 // Stop the monitor if no servers are running
                 if servers.lock().unwrap().is_empty() {
-                    let mut running = servers.lock().unwrap();
-                    // Hack: need separate lock, just break the loop
-                    drop(running);
-                    // Actually, let's just continue checking — pool may grow again
+                    // Servers are empty; continue monitoring in case new ones start later
                 }
             }
         });
@@ -326,5 +323,15 @@ impl LspServerPool {
 impl Default for LspServerPool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Debug for LspServerPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LspServerPool")
+            .field("configs", &self.configs.keys())
+            .field("running_count", &self.running_count())
+            .field("max_concurrent", &self.max_concurrent)
+            .finish()
     }
 }

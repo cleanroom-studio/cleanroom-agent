@@ -26,6 +26,7 @@ pub mod scheduler;
 pub mod test_extractor;
 pub mod compat_detector;
 pub mod design_decisions;
+pub mod tree_sitter_parser;
 
 pub use orchestrator::{Orchestrator, OrchestratorConfig};
 pub use producer::{ProducerAgent, ProducerConfig};

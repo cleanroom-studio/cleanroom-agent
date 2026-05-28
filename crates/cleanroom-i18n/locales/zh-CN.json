@@ -129,6 +129,20 @@
 
     "check_consistency": "运行一致性检查（fast/full/deep）",
     "compute_fingerprints": "重新计算并存储指纹",
+    "resolve_inconsistency": "使用特定策略解决不一致",
+    "get_inconsistency_report": "获取文档的详细不一致报告",
+
+    "lsp_initialize": "初始化指定语言的 LSP 服务器（typescript/rust/python/go）",
+    "lsp_get_document_symbols": "通过 LSP 获取文件的文档符号",
+    "lsp_get_type_info": "获取指定位置的类型信息",
+    "lsp_find_references": "查找符号的所有引用",
+    "lsp_get_diagnostics": "获取文件的诊断信息（错误/警告）",
+    "lsp_get_hierarchy": "获取符号的类型层次结构（父/子类型）",
+
+    "set_compatibility_mode": "设置文档的兼容模式（full/mixed/clean/custom）",
+    "list_compat_layers": "列出文档的所有兼容层",
+    "get_compat_layer_detail": "获取特定兼容层的详细信息",
+    "ignore_compat_layer": "将兼容层标记为已解决/已忽略",
 
     "error_prefix": "错误：{0}"
   },
