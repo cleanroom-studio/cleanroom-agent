@@ -24,17 +24,14 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    // Parse CLI args early to get log level
     let args: Vec<String> = std::env::args().collect();
     let cli = Cli::try_parse_from(&args)?;
 
-    // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&cli.log_level))
         .init();
 
     info!("cleanroom-agent v{}", env!("CARGO_PKG_VERSION"));
 
-    // Run the selected command
     commands::run(cli.command, &cli.db)
 }
