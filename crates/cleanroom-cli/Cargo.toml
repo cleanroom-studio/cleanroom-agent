@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 cleanroom-agent = { path = "../cleanroom-agent" }
+cleanroom-db = { path = "../cleanroom-db" }
 cleanroom-mcp = { path = "../cleanroom-mcp" }
 clap.workspace = true
 tokio.workspace = true

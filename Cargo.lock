@@ -446,6 +446,7 @@ dependencies = [
  "glob",
  "ignore",
  "regex",
+ "rusqlite",
  "sdef-core",
  "serde",
  "serde_json",
@@ -463,6 +464,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cleanroom-agent",
+ "cleanroom-db",
  "cleanroom-mcp",
  "tokio",
  "tracing",
@@ -487,6 +489,7 @@ dependencies = [
 name = "cleanroom-lsp"
 version = "0.1.0"
 dependencies = [
+ "lazy_static",
  "lsp-server",
  "lsp-types",
  "sdef-core",
@@ -503,6 +506,7 @@ name = "cleanroom-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "cleanroom-db",
  "rmcp",
  "rmcp-macros",
