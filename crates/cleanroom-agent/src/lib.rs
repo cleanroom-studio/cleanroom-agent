@@ -12,6 +12,7 @@ pub mod completeness;
 pub mod compat_resolver;
 pub mod incremental_analysis;
 pub mod migration_gen;
+pub mod version_upgrade;
 pub mod repo_scanner;
 pub mod module_partitioner;
 pub mod dependency_graph;
@@ -31,3 +32,4 @@ pub use compat_resolver::{CompatibilityResolver, CompatibilityMode as ResolverMo
 pub use completeness::{CompletenessValidator, CompletenessReport, VerificationResult, CoverageScore, format_report};
 pub use incremental_analysis::{IncrementalAnalyzer, IncrementalDiff};
 pub use migration_gen::{MigrationGenerator, MigrationCode};
+pub use version_upgrade::{VersionUpgradeAnalyzer, VersionUpgradeReport, BreakingChange, ChangeType, SuggestedMigration};
