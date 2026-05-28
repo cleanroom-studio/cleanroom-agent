@@ -9,6 +9,7 @@ pub mod naming;
 pub mod name_resolution;
 pub mod consistency;
 pub mod completeness;
+pub mod compat_resolver;
 pub mod repo_scanner;
 pub mod module_partitioner;
 pub mod dependency_graph;
