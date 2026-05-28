@@ -134,23 +134,34 @@ impl NameResolutionService {
         })
     }
 
-    /// Generate a fully-qualified name.
+    /// Generate a fully-qualified name with namespace control.
     pub fn fully_qualified_name(
         &self,
         document_name: &str,
         entity: &str,
         language: &str,
+        namespace_mode: crate::naming::NamespaceMode,
+        custom_namespace: Option<&str>,
     ) -> String {
         let lang = Language::from_str(language).unwrap_or(Language::TypeScript);
         let local_name = self.names.convert_for_language(entity, lang);
 
-        match language {
-            "rust" => format!("{}::{}", document_name.replace('.', "::"), local_name),
-            "typescript" | "javascript" => format!("{}.{}", document_name, local_name),
-            "python" => format!("{}.{}", document_name.replace('.', "_"), local_name),
-            "java" => format!("{}.{}", document_name, local_name),
-            "go" => format!("{}.{}", document_name, local_name),
-            _ => local_name,
+        match namespace_mode {
+            crate::naming::NamespaceMode::FromDocumentName => match language {
+                "rust" => format!("{}::{}", document_name.replace('.', "::"), local_name),
+                "typescript" | "javascript" => format!("{}.{}", document_name, local_name),
+                "python" => format!("{}.{}", document_name.replace('.', "_"), local_name),
+                "java" | "go" => format!("{}.{}", document_name, local_name),
+                _ => local_name,
+            },
+            crate::naming::NamespaceMode::Manual => {
+                if let Some(ns) = custom_namespace.filter(|p| !p.is_empty()) {
+                    format!("{}::{}", ns, local_name)
+                } else {
+                    local_name
+                }
+            }
+            crate::naming::NamespaceMode::None => local_name,
         }
     }
 }
@@ -235,13 +246,31 @@ mod tests {
     #[test]
     fn test_fully_qualified_name() {
         let (_db, svc) = setup();
-        let fqn = svc.fully_qualified_name("com.example", "UserService", "rust");
+        let ns = crate::naming::NamespaceMode::FromDocumentName;
+        let fqn = svc.fully_qualified_name("com.example", "UserService", "rust", ns, None);
         assert!(fqn.contains("com::example"));
         assert!(fqn.contains("user_service"));
 
-        let ts_fqn = svc.fully_qualified_name("com.example", "UserService", "typescript");
+        let ts_fqn = svc.fully_qualified_name("com.example", "UserService", "typescript", ns, None);
         assert!(ts_fqn.contains("com.example"));
         assert!(ts_fqn.contains("userService"));
+    }
+
+    #[test]
+    fn test_fully_qualified_name_none_namespace() {
+        let (_db, svc) = setup();
+        let ns = crate::naming::NamespaceMode::None;
+        let fqn = svc.fully_qualified_name("com.example", "UserService", "rust", ns, None);
+        assert_eq!(fqn, "user_service", "None mode should return bare name");
+    }
+
+    #[test]
+    fn test_fully_qualified_name_manual_namespace() {
+        let (_db, svc) = setup();
+        let ns = crate::naming::NamespaceMode::Manual;
+        let fqn = svc.fully_qualified_name("com.example", "UserService", "rust", ns, Some("myapp"));
+        assert!(fqn.contains("myapp"));
+        assert!(fqn.contains("user_service"));
     }
 
     #[test]

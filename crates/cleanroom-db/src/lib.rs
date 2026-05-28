@@ -7,7 +7,7 @@ pub mod export_import;
 pub mod migrations;
 pub mod repositories;
 
-pub use database::Database;
+pub use database::{Database, BackupConfig};
 pub use error::{DbError, DbResult};
 
 // Re-export common types

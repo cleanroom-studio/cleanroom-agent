@@ -28,6 +28,8 @@ pub mod compat_detector;
 pub mod design_decisions;
 pub mod tree_sitter_parser;
 
+pub use naming::{DeterministicNames, Language, NameStyle, NamespaceMode};
+pub use name_resolution::{NameResolutionService, ResolvedName};
 pub use orchestrator::{Orchestrator, OrchestratorConfig};
 pub use producer::{ProducerAgent, ProducerConfig};
 pub use consumer::{ConsumerAgent, ConsumerConfig, CompatibilityMode, Fidelity};

@@ -1,12 +1,37 @@
 //! Database connection management.
 
 use rusqlite::{Connection, OpenFlags};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tracing::{info, instrument};
+use std::time::Duration;
+use tracing::{info, instrument, warn};
 
 use super::error::{DbError, DbResult};
 use super::migrations;
+
+/// Backup scheduling configuration.
+#[derive(Debug, Clone)]
+pub struct BackupConfig {
+    /// Backup interval (e.g., Duration::from_secs(3600) for hourly).
+    pub interval: Duration,
+    /// Directory to store backups.
+    pub backup_dir: PathBuf,
+    /// Filename template. Supports {timestamp} placeholder.
+    pub filename_template: String,
+    /// Maximum number of backups to keep (0 = unlimited).
+    pub max_backups: usize,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(3600), // hourly
+            backup_dir: PathBuf::from("."),
+            filename_template: "state-{timestamp}.db".to_string(),
+            max_backups: 24, // keep 24 hourly backups
+        }
+    }
+}
 
 /// Thread-safe database connection wrapper.
 #[derive(Debug, Clone)]
@@ -127,5 +152,82 @@ impl Database {
 
         info!(path = %dest_path.display(), "Backup created successfully");
         Ok(())
+    }
+
+    /// Start a background scheduled backup task.
+    ///
+    /// Spawns a tokio task that creates backups at the configured interval.
+    /// The task prunes old backups to keep at most `config.max_backups`.
+    /// Returns a shutdown handle that can be used to stop the backup loop.
+    pub fn start_scheduled_backup(
+        db_clone: Self,
+        config: BackupConfig,
+    ) -> tokio::sync::oneshot::Sender<()> {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            // Ensure backup directory exists
+            let _ = tokio::task::spawn_blocking({
+                let dir = config.backup_dir.clone();
+                move || std::fs::create_dir_all(&dir)
+            }).await;
+
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        info!("Scheduled backup task shutting down");
+                        break;
+                    }
+                    _ = tokio::time::sleep(config.interval) => {
+                        // Generate backup filename with timestamp
+                        let timestamp = chrono::Utc::now()
+                            .format("%Y%m%d-%H%M%S")
+                            .to_string();
+                        let filename = config.filename_template
+                            .replace("{timestamp}", &timestamp);
+                        let backup_path = config.backup_dir.join(&filename);
+
+                        info!(path = %backup_path.display(), "Starting scheduled backup");
+
+                        if let Err(e) = db_clone.backup(&backup_path) {
+                            warn!(error = %e, "Scheduled backup failed");
+                        } else {
+                            // Prune old backups
+                            if config.max_backups > 0 {
+                                prune_backups(&config.backup_dir, config.max_backups);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        shutdown_tx
+    }
+}
+
+/// Keep only the N most recent backup files.
+fn prune_backups(backup_dir: &Path, max_keep: usize) {
+    let mut backups: Vec<_> = match std::fs::read_dir(backup_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "db"))
+            .map(|e| (e.path(), std::fs::metadata(e.path()).and_then(|m| m.modified()).ok()))
+            .collect(),
+        Err(_) => return,
+    };
+
+    // Sort by modification time (oldest first)
+    backups.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // Remove oldest backups beyond the limit
+    if backups.len() > max_keep {
+        for (path, _) in backups.drain(..backups.len() - max_keep) {
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!(path = %path.display(), error = %e, "Failed to prune old backup");
+            } else {
+                info!(path = %path.display(), "Pruned old backup");
+            }
+        }
     }
 }

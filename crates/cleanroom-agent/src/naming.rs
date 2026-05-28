@@ -1,6 +1,55 @@
-//! Naming Service — deterministic symbol naming.
+//! Naming Service — deterministic symbol naming with namespace support.
 
 use std::collections::HashMap;
+
+/// Namespace mode for fully-qualified name generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceMode {
+    /// Prefix with the document/module name (default).
+    FromDocumentName,
+    /// User-specified custom namespace prefix.
+    Manual,
+    /// No namespace prefix — use bare names.
+    None,
+}
+
+impl NamespaceMode {
+    /// Parse from string.
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "from_document_name" | "from-document-name" | "document" => Self::FromDocumentName,
+            "manual" => Self::Manual,
+            "none" => Self::None,
+            _ => Self::FromDocumentName,
+        }
+    }
+
+    /// Apply namespace to a name given a document name and optional custom prefix.
+    pub fn apply(&self, name: &str, document_name: &str, custom_namespace: Option<&str>) -> String {
+        match self {
+            Self::FromDocumentName => {
+                // Replace dots/slashes with language-appropriate separators
+                let ns = document_name.replace('.', "::").replace('/', "::");
+                format!("{}::{}", ns, name)
+            }
+            Self::Manual => {
+                if let Some(prefix) = custom_namespace.filter(|p| !p.is_empty()) {
+                    format!("{}::{}", prefix, name)
+                } else {
+                    name.to_string()
+                }
+            }
+            Self::None => name.to_string(),
+        }
+    }
+}
+
+impl Default for NamespaceMode {
+    fn default() -> Self {
+        Self::FromDocumentName
+    }
+}
 
 /// Name style for a programming language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
