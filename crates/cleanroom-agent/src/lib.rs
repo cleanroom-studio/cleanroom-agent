@@ -13,6 +13,8 @@ pub mod compat_resolver;
 pub mod incremental_analysis;
 pub mod migration_gen;
 pub mod version_upgrade;
+pub mod absorb_human_changes;
+pub mod consistency_checker;
 pub mod repo_scanner;
 pub mod module_partitioner;
 pub mod dependency_graph;
@@ -33,3 +35,5 @@ pub use completeness::{CompletenessValidator, CompletenessReport, VerificationRe
 pub use incremental_analysis::{IncrementalAnalyzer, IncrementalDiff};
 pub use migration_gen::{MigrationGenerator, MigrationCode};
 pub use version_upgrade::{VersionUpgradeAnalyzer, VersionUpgradeReport, BreakingChange, ChangeType, SuggestedMigration};
+pub use absorb_human_changes::{HumanChangeAbsorber, AbsorbResult, HumanChange, ChangeType as AbsorbChangeType};
+pub use consistency_checker::{ConsistencyChecker, ConsistencyCheckerConfig};

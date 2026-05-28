@@ -23,15 +23,20 @@ pub struct Fingerprint {
 
 /// Fingerprint repository.
 pub struct FingerprintRepository {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl FingerprintRepository {
     /// Create a new fingerprint repository.
     pub fn new(conn: Connection) -> Self {
         Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         }
+    }
+
+    /// Create from an existing Arc-wrapped connection.
+    pub fn from_arc(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
     }
 
     /// Upsert a fingerprint.
