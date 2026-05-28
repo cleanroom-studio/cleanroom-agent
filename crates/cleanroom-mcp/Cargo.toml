@@ -18,3 +18,5 @@ anyhow.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+rusqlite.workspace = true
+serde_yaml.workspace = true

@@ -6,6 +6,7 @@
 
 pub mod types;
 pub mod version;
+pub mod validator;
 
 // Re-export types from submodules
 pub use types::root::SoftwareDefinition;

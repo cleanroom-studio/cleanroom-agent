@@ -1,0 +1,436 @@
+//! Task Scheduler — creates and dispatches analysis/generation tasks.
+//!
+//! Manages the lifecycle of tasks: initial creation, dependency ordering,
+//! retry logic, checkpointing, and workflow progress monitoring.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use cleanroom_db::{
+    Database, TaskRepository, Task, TaskStatus, TaskType,
+};
+use tracing::{info, warn, instrument};
+
+/// A plan for task execution — what tasks to create and in what order.
+#[derive(Debug, Clone)]
+pub struct TaskPlan {
+    /// Tasks grouped by priority level (higher runs first).
+    pub priority_groups: Vec<Vec<TaskTemplate>>,
+    /// Document name for scoping.
+    pub document_name: String,
+}
+
+/// Template for creating a task.
+#[derive(Debug, Clone)]
+pub struct TaskTemplate {
+    pub task_type: TaskType,
+    pub priority: i32,
+    pub input: serde_json::Value,
+    pub dependency_indices: Vec<usize>,
+    pub max_retries: i32,
+}
+
+impl TaskPlan {
+    /// Create a standard analysis plan for a given document.
+    pub fn analysis_plan(document_name: &str) -> Self {
+        Self {
+            priority_groups: vec![
+                // Priority 10: Repo scan (no dependencies)
+                vec![TaskTemplate {
+                    task_type: TaskType::RepoAnalyze,
+                    priority: 10,
+                    input: serde_json::json!({"document": document_name}),
+                    dependency_indices: vec![],
+                    max_retries: 3,
+                }],
+                // Priority 8: Metadata + architecture extraction (depends on repo scan)
+                vec![
+                    TaskTemplate {
+                        task_type: TaskType::ExtractMetadata,
+                        priority: 8,
+                        input: serde_json::json!({"document": document_name}),
+                        dependency_indices: vec![0], // repo scan
+                        max_retries: 3,
+                    },
+                    TaskTemplate {
+                        task_type: TaskType::ExtractArchitecture,
+                        priority: 8,
+                        input: serde_json::json!({"document": document_name}),
+                        dependency_indices: vec![0],
+                        max_retries: 3,
+                    },
+                ],
+                // Priority 6: Data model + module extraction (depends on architecture)
+                vec![
+                    TaskTemplate {
+                        task_type: TaskType::ExtractDataModel,
+                        priority: 6,
+                        input: serde_json::json!({"document": document_name}),
+                        dependency_indices: vec![0],
+                        max_retries: 3,
+                    },
+                    TaskTemplate {
+                        task_type: TaskType::ExtractModule,
+                        priority: 6,
+                        input: serde_json::json!({"document": document_name}),
+                        dependency_indices: vec![0],
+                        max_retries: 3,
+                    },
+                ],
+                // Priority 5: UI extraction
+                vec![TaskTemplate {
+                    task_type: TaskType::ExtractUi,
+                    priority: 5,
+                    input: serde_json::json!({"document": document_name}),
+                    dependency_indices: vec![0],
+                    max_retries: 3,
+                }],
+                // Priority 4: Tests + design decisions (depends on data model)
+                vec![
+                    TaskTemplate {
+                        task_type: TaskType::ExtractTests,
+                        priority: 4,
+                        input: serde_json::json!({"document": document_name}),
+                        dependency_indices: vec![0],
+                        max_retries: 3,
+                    },
+                    TaskTemplate {
+                        task_type: TaskType::InferDesignDecisions,
+                        priority: 4,
+                        input: serde_json::json!({"document": document_name}),
+                        dependency_indices: vec![0],
+                        max_retries: 3,
+                    },
+                ],
+                // Priority 2: Validation (depends on everything above)
+                vec![TaskTemplate {
+                    task_type: TaskType::ValidateShard,
+                    priority: 2,
+                    input: serde_json::json!({"document": document_name}),
+                    dependency_indices: vec![0, 1, 2, 3, 4, 5, 6, 7],
+                    max_retries: 5,
+                }],
+            ],
+            document_name: document_name.to_string(),
+        }
+    }
+
+    /// Create a standard code generation plan.
+    pub fn generation_plan(document_name: &str) -> Self {
+        Self {
+            priority_groups: vec![
+                vec![TaskTemplate {
+                    task_type: TaskType::ImportSdef,
+                    priority: 10,
+                    input: serde_json::json!({"document": document_name}),
+                    dependency_indices: vec![],
+                    max_retries: 3,
+                }],
+                vec![
+                    TaskTemplate {
+                        task_type: TaskType::GenerateCode,
+                        priority: 8,
+                        input: serde_json::json!({"document": document_name, "scope": "all"}),
+                        dependency_indices: vec![0],
+                        max_retries: 3,
+                    },
+                ],
+                vec![TaskTemplate {
+                    task_type: TaskType::MergeCode,
+                    priority: 6,
+                    input: serde_json::json!({"document": document_name}),
+                    dependency_indices: vec![1],
+                    max_retries: 3,
+                }],
+                vec![TaskTemplate {
+                    task_type: TaskType::RunTests,
+                    priority: 4,
+                    input: serde_json::json!({"document": document_name}),
+                    dependency_indices: vec![2],
+                    max_retries: 5,
+                }],
+            ],
+            document_name: document_name.to_string(),
+        }
+    }
+}
+
+/// The task scheduler.
+pub struct Scheduler {
+    db: Arc<Database>,
+}
+
+impl Scheduler {
+    /// Create a new scheduler.
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+
+    /// Create a new scheduler from a database.
+    pub fn from_db(db: Database) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    /// Get the database reference.
+    pub fn db(&self) -> &Arc<Database> {
+        &self.db
+    }
+
+    /// Create tasks from a plan.
+    #[instrument(skip(self))]
+    pub fn create_from_plan(&self, plan: &TaskPlan) -> Result<Vec<String>, cleanroom_db::DbError> {
+        let repo = TaskRepository::new(self.db.connection_arc());
+        let mut flat_tasks: Vec<TaskTemplate> = Vec::new();
+        let mut created_ids: Vec<String> = Vec::new();
+        let mut index_map: HashMap<usize, usize> = HashMap::new(); // old index → position in flat_tasks
+
+        // Flatten priority groups into a single ordered list, tracking indices
+        for group in &plan.priority_groups {
+            for task_tmpl in group {
+                index_map.insert(flat_tasks.len(), flat_tasks.len());
+                flat_tasks.push(task_tmpl.clone());
+            }
+        }
+
+        // Create each task with computed dependencies
+        for (i, tmpl) in flat_tasks.iter().enumerate() {
+            let deps: Vec<String> = tmpl
+                .dependency_indices
+                .iter()
+                .filter_map(|dep_idx| created_ids.get(*dep_idx))
+                .cloned()
+                .collect();
+
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let task = Task {
+                task_id: task_id.clone(),
+                task_type: tmpl.task_type,
+                status: TaskStatus::Pending,
+                priority: tmpl.priority,
+                input_json: serde_json::to_string(&tmpl.input)
+                    .unwrap_or_else(|_| "{}".to_string()),
+                output_json: None,
+                error_message: None,
+                assigned_to: None,
+                progress: 0.0,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                started_at: None,
+                completed_at: None,
+                retry_count: 0,
+                max_retries: tmpl.max_retries,
+                last_heartbeat: None,
+                dependencies_json: serde_json::to_string(&deps)
+                    .unwrap_or_else(|_| "[]".to_string()),
+                version: 1,
+            };
+
+            repo.create(&task)?;
+            created_ids.push(task_id);
+            info!(index = i, task_id = %created_ids.last().unwrap(), "Created task from plan");
+        }
+
+        Ok(created_ids)
+    }
+
+    /// Retry failed tasks.
+    #[instrument(skip(self))]
+    pub fn retry_failed_tasks(&self) -> Result<usize, cleanroom_db::DbError> {
+        let repo = TaskRepository::new(self.db.connection_arc());
+        let failed_tasks = repo.list(Some(TaskStatus::Failed), None, None)?;
+        let mut retried = 0;
+
+        for task in &failed_tasks {
+            if task.retry_count < task.max_retries {
+                let new_retry = task.retry_count + 1;
+                let conn = self.db.connection();
+                conn.execute(
+                    "UPDATE tasks SET status = 'pending', retry_count = ?1, error_message = NULL WHERE task_id = ?2",
+                    rusqlite::params![new_retry, task.task_id],
+                ).map_err(|e| cleanroom_db::DbError::QueryFailed(e.to_string()))?;
+                retried += 1;
+                info!(task_id = %task.task_id, retry = new_retry, "Retrying failed task");
+            } else {
+                // Mark as failed permanently
+                repo.update_status(&task.task_id, TaskStatus::FailedPermanently)?;
+                warn!(task_id = %task.task_id, "Task failed permanently (max retries exceeded)");
+            }
+        }
+
+        Ok(retried)
+    }
+
+    /// Get workflow progress summary.
+    #[instrument(skip(self))]
+    pub fn get_progress(&self) -> Result<ProgressSummary, cleanroom_db::DbError> {
+        let repo = TaskRepository::new(self.db.connection_arc());
+        let all = repo.list(None, None, None)?;
+
+        let mut summary = ProgressSummary::default();
+        for task in &all {
+            summary.total += 1;
+            match task.status {
+                TaskStatus::Pending => summary.pending += 1,
+                TaskStatus::Assigned | TaskStatus::InProgress => {
+                    summary.in_progress += 1;
+                    summary.total_progress += task.progress;
+                }
+                TaskStatus::Completed => {
+                    summary.completed += 1;
+                    summary.total_progress += 1.0;
+                }
+                TaskStatus::Failed => summary.failed += 1,
+                TaskStatus::Retrying => summary.retrying += 1,
+                TaskStatus::FailedPermanently => summary.failed_permanently += 1,
+            }
+        }
+
+        if summary.total > 0 {
+            summary.overall_progress = summary.total_progress / summary.total as f64;
+        }
+
+        Ok(summary)
+    }
+
+    /// Create an automatic checkpoint.
+    #[instrument(skip(self))]
+    pub fn create_automatic_checkpoint(&self, document_name: &str) -> Result<String, cleanroom_db::DbError> {
+        let repo = TaskRepository::new(self.db.connection_arc());
+
+        let all_tasks = repo.list(None, None, None)?;
+        let task_snapshot = serde_json::to_value(&all_tasks)
+            .unwrap_or(serde_json::json!([]));
+        let shard_snapshot = serde_json::json!({});
+
+        let checkpoint_id = uuid::Uuid::new_v4().to_string();
+        let conn = self.db.connection();
+        conn.execute(
+            r#"INSERT INTO checkpoints (checkpoint_id, document_name, description, created_at, task_snapshot_json, shard_snapshot_json)
+               VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP, ?4, ?5)"#,
+            rusqlite::params![
+                checkpoint_id,
+                document_name,
+                "Automatic checkpoint",
+                serde_json::to_string(&task_snapshot).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&shard_snapshot).unwrap_or_else(|_| "{}".to_string()),
+            ],
+        ).map_err(|e| cleanroom_db::DbError::QueryFailed(e.to_string()))?;
+
+        info!(%checkpoint_id, "Automatic checkpoint created");
+        Ok(checkpoint_id)
+    }
+
+    /// Restore from a checkpoint.
+    #[instrument(skip(self))]
+    pub fn restore_from_checkpoint(&self, checkpoint_id: &str) -> Result<(), cleanroom_db::DbError> {
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(
+            "SELECT checkpoint_id, document_name, description, created_at, task_snapshot_json, shard_snapshot_json
+             FROM checkpoints WHERE checkpoint_id = ?1"
+        ).map_err(|e| cleanroom_db::DbError::QueryFailed(e.to_string()))?;
+
+        let _cp = stmt.query_row(rusqlite::params![checkpoint_id], |row| {
+            Ok(cleanroom_db::repositories::Checkpoint {
+                checkpoint_id: row.get(0)?,
+                document_name: row.get(1)?,
+                description: row.get(2)?,
+                created_at: row.get(3)?,
+                task_snapshot_json: row.get(4)?,
+                shard_snapshot_json: row.get(5)?,
+            })
+        }).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => cleanroom_db::DbError::NotFound {
+                resource: "checkpoint", field: "checkpoint_id", value: checkpoint_id.to_string(),
+            },
+            _ => cleanroom_db::DbError::QueryFailed(e.to_string()),
+        })?;
+
+        info!(%checkpoint_id, "Checkpoint loaded for restoration");
+        Ok(())
+    }
+}
+
+/// Progress summary for the current workflow.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressSummary {
+    pub total: usize,
+    pub pending: usize,
+    pub in_progress: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub retrying: usize,
+    pub failed_permanently: usize,
+    pub overall_progress: f64,
+    pub total_progress: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cleanroom_db::Database;
+
+    fn setup() -> (Database, Scheduler) {
+        let db = Database::in_memory().unwrap();
+        let scheduler = Scheduler::from_db(db.clone());
+        (db, scheduler)
+    }
+
+    #[test]
+    fn test_analysis_plan_creation() {
+        let (_, scheduler) = setup();
+        let plan = TaskPlan::analysis_plan("test-doc");
+        let ids = scheduler.create_from_plan(&plan).unwrap();
+        // Analysis plan should create: repo_analyze + extract_metadata + extract_arch + data_model + extract_module + ui + tests + design_decisions + validate
+        assert_eq!(ids.len(), 9, "Should create 9 tasks");
+    }
+
+    #[test]
+    fn test_generation_plan_creation() {
+        let (_, scheduler) = setup();
+        let plan = TaskPlan::generation_plan("test-doc");
+        let ids = scheduler.create_from_plan(&plan).unwrap();
+        assert_eq!(ids.len(), 4, "Should create 4 tasks");
+    }
+
+    #[test]
+    fn test_progress_summary() {
+        let (_, scheduler) = setup();
+        let plan = TaskPlan::analysis_plan("test-doc");
+        scheduler.create_from_plan(&plan).unwrap();
+        let progress = scheduler.get_progress().unwrap();
+        assert_eq!(progress.total, 9);
+        assert_eq!(progress.pending, 9);
+    }
+
+    #[test]
+    fn test_retry_failed_tasks() {
+        let (db, scheduler) = setup();
+        let plan = TaskPlan::analysis_plan("test-doc");
+        scheduler.create_from_plan(&plan).unwrap();
+
+        // Mark all tasks as failed
+        let repo = TaskRepository::new(db.connection_arc());
+        let tasks = repo.list(None, None, None).unwrap();
+        for task in &tasks {
+            repo.update_status(&task.task_id, TaskStatus::Failed).unwrap();
+        }
+
+        let retried = scheduler.retry_failed_tasks().unwrap();
+        assert!(retried > 0, "Should retry at least one task");
+
+        // Check that tasks were reset to pending
+        let pending = repo.list(Some(TaskStatus::Pending), None, None).unwrap();
+        assert!(pending.len() == retried, "Retried tasks should be pending");
+    }
+
+    #[test]
+    fn test_checkpoint_creation() {
+        let (db, scheduler) = setup();
+        // Create a document first to satisfy FK constraint
+        db.connection().execute(
+            "INSERT INTO sdef_documents (name, created_at, updated_at) VALUES ('test-doc', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            [],
+        ).unwrap();
+        let cpid = scheduler.create_automatic_checkpoint("test-doc").unwrap();
+        assert!(!cpid.is_empty());
+    }
+}

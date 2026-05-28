@@ -1,22 +1,15 @@
-//! Task management MCP tools.
-//!
-//! These will be moved onto the `CleanroomMcpServer` `#[tool_handler]` impl
-//! once `cleanroom-db` is implemented.
+//! Task management MCP tool parameters and handlers.
 
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Task creation parameters.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateTaskParams {
-    /// Task type
     pub task_type: String,
-    /// Task input parameters
     pub input: serde_json::Value,
-    /// Priority (1-10)
     #[serde(default = "default_priority")]
     pub priority: i32,
-    /// Dependent task IDs
     #[serde(default)]
     pub dependencies: Vec<String>,
 }
@@ -71,3 +64,25 @@ pub struct ListTasksParams {
 }
 
 fn default_limit() -> usize { 20 }
+
+/// Result of a task listing or get operation.
+#[derive(Debug, Serialize)]
+pub struct TaskResult {
+    pub task_id: String,
+    pub task_type: String,
+    pub status: String,
+    pub priority: i32,
+    pub input: serde_json::Value,
+    pub output: Option<serde_json::Value>,
+    pub error_message: Option<String>,
+    pub assigned_to: Option<String>,
+    pub progress: f64,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub retry_count: i32,
+    pub max_retries: i32,
+    pub last_heartbeat: Option<String>,
+    pub dependencies: Vec<String>,
+    pub version: i32,
+}
