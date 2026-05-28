@@ -1,9 +1,12 @@
 //! Producer Agent — analyzes code repositories.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use cleanroom_db::{Database, DbError, Task, TaskRepository, TaskType};
 use tracing::{info, instrument};
+
+use crate::producer_pipeline::run_analysis_pipeline;
 
 /// Producer configuration.
 #[derive(Debug, Clone)]
@@ -60,17 +63,12 @@ impl ProducerAgent {
     pub async fn process_next_task(&self) -> Result<Option<Task>, DbError> {
         let repo = TaskRepository::new(self.db.connection_arc());
 
-        // Atomically claim a task
         if let Some(task) = repo.claim(&self.agent_id)? {
             info!(task_id = %task.task_id, task_type = ?task.task_type, "Processing task");
 
             match task.task_type {
                 TaskType::RepoAnalyze => self.analyze_repo(&task).await?,
-                TaskType::ExtractDataModel => self.extract_data_model(&task).await?,
-                TaskType::ExtractModule => self.extract_module(&task).await?,
-                TaskType::ExtractArchitecture => self.extract_architecture(&task).await?,
                 _ => {
-                    // Mark as completed with placeholder
                     repo.complete(&task.task_id, "{}")?;
                 }
             }
@@ -81,41 +79,53 @@ impl ProducerAgent {
         Ok(None)
     }
 
+    /// Full repository analysis using the integrated pipeline.
     async fn analyze_repo(&self, task: &Task) -> Result<(), DbError> {
         let repo = TaskRepository::new(self.db.connection_arc());
         
-        // Update progress
-        repo.update_progress(&task.task_id, 0.5)?;
+        // Parse task input
+        let input: serde_json::Value = serde_json::from_str(&task.input_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
         
-        // TODO: Implement actual repo analysis with LSP
-        // For now, just mark as complete
+        let repo_path = input.get("repo_path")
+            .and_then(|v| v.as_str())
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new("."));
         
-        repo.complete(&task.task_id, &serde_json::json!({
-            "status": "analyzed",
-            "modules_found": 0,
-        }).to_string())?;
+        let project_name = input.get("project_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unnamed");
         
-        Ok(())
-    }
+        info!(path = %repo_path.display(), project = %project_name, "Starting pipeline");
 
-    async fn extract_data_model(&self, task: &Task) -> Result<(), DbError> {
-        let repo = TaskRepository::new(self.db.connection_arc());
-        repo.update_progress(&task.task_id, 0.5)?;
-        repo.complete(&task.task_id, "{}")?;
-        Ok(())
-    }
+        // Update progress to 10%
+        repo.update_progress(&task.task_id, 0.1)?;
 
-    async fn extract_module(&self, task: &Task) -> Result<(), DbError> {
-        let repo = TaskRepository::new(self.db.connection_arc());
-        repo.update_progress(&task.task_id, 0.5)?;
-        repo.complete(&task.task_id, "{}")?;
-        Ok(())
-    }
+        // Run the full pipeline
+        let result = run_analysis_pipeline(
+            self.db.clone(),
+            repo_path,
+            project_name,
+            "0.1.0",
+            None,
+        ).await?;
 
-    async fn extract_architecture(&self, task: &Task) -> Result<(), DbError> {
-        let repo = TaskRepository::new(self.db.connection_arc());
-        repo.update_progress(&task.task_id, 0.5)?;
-        repo.complete(&task.task_id, "{}")?;
+        // Update progress to 90%
+        repo.update_progress(&task.task_id, 0.9)?;
+
+        // Create output summary
+        let output = crate::producer_pipeline::result_to_json(&result);
+
+        // Complete task
+        repo.complete(&task.task_id, &serde_json::to_string(&output).unwrap_or_default())?;
+
+        info!(
+            files = result.file_count,
+            modules = result.module_count,
+            data_models = result.sdef.data_models.as_ref().map(|v| v.len()).unwrap_or(0),
+            "Repository analysis complete"
+        );
+
         Ok(())
     }
 
@@ -123,5 +133,18 @@ impl ProducerAgent {
     pub async fn heartbeat(&self, task_id: &str) -> Result<(), DbError> {
         let repo = TaskRepository::new(self.db.connection_arc());
         repo.heartbeat(task_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_process_next_task_no_tasks() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let agent = ProducerAgent::new(ProducerConfig::default(), db);
+        let result = agent.process_next_task().await.unwrap();
+        assert!(result.is_none(), "No tasks should be available");
     }
 }

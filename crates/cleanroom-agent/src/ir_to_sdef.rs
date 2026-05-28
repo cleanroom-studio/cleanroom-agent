@@ -448,7 +448,7 @@ impl SdefMapper {
         if let Some(models) = &sdef.data_models {
             for model in models {
                 conn.execute(
-                    "INSERT INTO data_models (entity, document_name, status, version, description)
+                    "INSERT OR IGNORE INTO data_models (entity, document_name, status, version, description)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         model.entity, self.config.document_name, "active",
