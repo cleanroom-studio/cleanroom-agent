@@ -12,6 +12,7 @@ pub mod module_partitioner;
 pub mod dependency_graph;
 pub mod ir_to_sdef;
 pub mod producer_pipeline;
+pub mod two_phase_commit;
 
 pub use orchestrator::{Orchestrator, OrchestratorConfig};
 pub use producer::{ProducerAgent, ProducerConfig};
