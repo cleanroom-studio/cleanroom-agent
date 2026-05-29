@@ -2,7 +2,7 @@
 
 use tree_sitter::Node;
 
-use crate::ir_to_sdef::{IrEntity, IrAttribute, IrMethod, IrParam};
+use crate::ir_to_sdef::{IrEntity, IrAttribute, IrParam};
 
 /// Extract top-level Python definitions as IR entities.
 pub fn extract_python_definitions(

@@ -13,6 +13,7 @@ use cleanroom_agent::{
     dependency_graph::DependencyGraph,
 };
 use cleanroom_db::Database;
+use tracing::info;
 
 /// Create a temporary directory with a minimal Rust project.
 fn create_test_project(tmp_dir: &std::path::Path) {

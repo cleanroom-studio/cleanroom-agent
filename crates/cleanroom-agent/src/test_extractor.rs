@@ -25,7 +25,7 @@ impl TestFramework {
     fn detect(file_name: &str, content: &str) -> Option<Self> {
         let ext = Path::new(file_name).extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
-            "rs" if content.contains("#[test]") || content.contains("#[tokio::test]") => Some(Self::RustNative),
+            "rs" if content.contains("#[test]") || content.contains("#[tokio::test]") || content.contains("fn test_") => Some(Self::RustNative),
             "ts" | "tsx" if content.contains("describe(") || content.contains("test(") => Some(Self::Jest),
             "js" | "jsx" if content.contains("describe(") || content.contains("it(") => Some(Self::Mocha),
             "py" if content.contains("def test_") || content.contains("unittest") => Some(Self::Pytest),

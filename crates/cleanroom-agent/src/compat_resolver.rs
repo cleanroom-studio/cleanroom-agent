@@ -2,7 +2,6 @@
 
 use rusqlite::params;
 use std::sync::Arc;
-use tracing::info;
 
 use cleanroom_db::{Database, DbError};
 

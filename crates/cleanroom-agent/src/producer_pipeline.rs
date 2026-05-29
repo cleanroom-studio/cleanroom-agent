@@ -7,7 +7,7 @@ use crate::dependency_graph::{DependencyGraph, DepNode, DepNodeType, DepEdgeKind
 use crate::ir_to_sdef::{SdefMapper, MapperConfig};
 use crate::module_partitioner::{partition_files, PartitionConfig};
 use crate::repo_scanner::{scan_repository, ScanConfig, SourceFile};
-use cleanroom_db::{Database, DbError, TaskRepository, TaskType, TaskStatus, Task};
+use cleanroom_db::{Database, DbError};
 use sdef_core::SoftwareDefinition;
 use tracing::{info, instrument};
 
@@ -104,7 +104,7 @@ pub async fn run_analysis_pipeline(
 }
 
 /// Build a dependency graph from files and modules.
-fn build_dependency_graph(files: &[SourceFile], modules: &[crate::module_partitioner::Module]) -> DependencyGraph {
+fn build_dependency_graph(_files: &[SourceFile], modules: &[crate::module_partitioner::Module]) -> DependencyGraph {
     let mut graph = DependencyGraph::new();
 
     // Add module nodes

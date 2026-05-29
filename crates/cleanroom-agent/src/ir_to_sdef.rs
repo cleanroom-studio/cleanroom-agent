@@ -1,7 +1,5 @@
 //! IR → S.DEF mapper — converts code analysis results into S.DEF entities.
 
-use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use sdef_core::*;
@@ -11,8 +9,7 @@ use chrono::Utc;
 use crate::module_partitioner::{Module, ModuleType};
 use crate::naming::{DeterministicNames, Language as Lang};
 use crate::repo_scanner::SourceFile;
-use cleanroom_db::{Database, DbError, SymbolRepository, SymbolType, SymbolEntry};
-use cleanroom_db::repositories::sdef_repository as sdef_repo;
+use cleanroom_db::{Database, DbError};
 
 /// Configuration for the S.DEF mapper.
 #[derive(Debug, Clone)]
@@ -255,7 +252,7 @@ impl SdefMapper {
         &self,
         entities: &[IrEntity],
         modules: &[Module],
-        files: &[SourceFile],
+        _files: &[SourceFile],
     ) -> Result<SoftwareDefinition, DbError> {
         let mut sdef = SoftwareDefinition::default();
         sdef.sdef_version = CURRENT_SCHEMA_VERSION.to_string();

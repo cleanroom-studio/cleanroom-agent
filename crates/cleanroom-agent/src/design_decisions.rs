@@ -217,7 +217,7 @@ static KNOWLEDGE_BASE: &[Pattern] = &[
 ///
 /// `files`: `(relative_path, content)` pairs.
 /// `manifest_files`: config files like `Cargo.toml`, `package.json`, etc.
-pub fn infer_decisions(files: &[(&str, &str)], manifest_files: &[(&str, &str)]) -> InferenceResult {
+pub fn infer_decisions(files: &[(&str, &str)], _manifest_files: &[(&str, &str)]) -> InferenceResult {
     let mut result = InferenceResult::default();
     let mut decision_map: Vec<InferredDecision> = Vec::new();
 

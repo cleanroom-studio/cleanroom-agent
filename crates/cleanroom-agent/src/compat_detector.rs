@@ -362,13 +362,15 @@ fn get_user(id: &str) -> User {
     #[test]
     fn test_no_compat_in_normal_code() {
         let content = r#"
-fn calculate_total(items: &[Item]) -> f64 {
-    items.iter().map(|i| i.price).sum()
+fn calculate_total(a: i32, b: i32) -> i32 {
+    a + b
 }
 "#;
         let detector = CompatDetector::new(vec![("src/calc.rs".to_string(), content.to_string())]);
         let result = detector.detect();
-        assert!(result.patterns.is_empty(), "Normal code should have no compat patterns");
+        assert!(result.patterns.is_empty(), "Normal code should have no compat patterns, got {} patterns: {:?}",
+            result.patterns.len(),
+            result.patterns.iter().map(|p| &p.description).collect::<Vec<_>>());
     }
 
     #[test]

@@ -1,10 +1,9 @@
 //! Name resolution service — deterministic naming + DB persistence with collision detection.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use cleanroom_db::{Database, DbError, SymbolRepository, SymbolType, SymbolEntry};
-use tracing::{info, instrument, warn};
+use tracing::{instrument, warn};
 
 use crate::naming::{DeterministicNames, Language};
 

@@ -9,7 +9,7 @@ use sdef_core::SoftwareDefinition;
 fn test_fingerprint_deterministic_json() {
     let sdef = SoftwareDefinition {
         name: "test-project".to_string(),
-        sdef_version: Some("1.0.0".to_string()),
+        sdef_version: "1.0.0".to_string(),
         description: Some("A test project".to_string()),
         ..Default::default()
     };
@@ -30,13 +30,13 @@ fn test_fingerprint_deterministic_json() {
 fn test_fingerprint_different_inputs() {
     let sdef_a = SoftwareDefinition {
         name: "project-a".to_string(),
-        sdef_version: Some("1.0.0".to_string()),
+        sdef_version: "1.0.0".to_string(),
         ..Default::default()
     };
 
     let sdef_b = SoftwareDefinition {
         name: "project-b".to_string(),
-        sdef_version: Some("1.0.0".to_string()),
+        sdef_version: "1.0.0".to_string(),
         ..Default::default()
     };
 
@@ -63,12 +63,13 @@ fn test_fingerprint_format() {
 fn test_fingerprint_includes_fields() {
     let sdef = SoftwareDefinition {
         name: "test".to_string(),
-        sdef_version: Some("1.0.0".to_string()),
+        sdef_version: "1.0.0".to_string(),
         description: Some("desc".to_string()),
         metadata: Some(sdef_core::SoftwareMetadata {
             authors: Some(vec![sdef_core::Author {
                 name: "Author".to_string(),
                 email: Some("author@test.com".to_string()),
+                url: None,
             }]),
             license: Some("MIT".to_string()),
             ..Default::default()

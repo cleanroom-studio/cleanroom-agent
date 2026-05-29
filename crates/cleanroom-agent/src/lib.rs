@@ -45,6 +45,7 @@ pub use migration_gen::{MigrationGenerator, MigrationCode};
 pub use version_upgrade::{VersionUpgradeAnalyzer, VersionUpgradeReport, BreakingChange, ChangeType, SuggestedMigration};
 pub use absorb_human_changes::{HumanChangeAbsorber, AbsorbResult, HumanChange, ChangeType as AbsorbChangeType};
 pub use consistency_checker::{ConsistencyChecker, ConsistencyCheckerConfig};
+pub use consistency::{ConsistencyService, CheckLevel, FixStrategy, Inconsistency};
 pub use code_merger::{CodeMerger, MergeConfig, MergeResult, CodeFragment, MergeConflict};
 pub use scheduler::{Scheduler, TaskPlan, ProgressSummary};
 pub use test_extractor::{extract_tests, build_test_contract, persist_test_contract, ExtractionResult};

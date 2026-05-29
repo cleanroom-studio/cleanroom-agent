@@ -1,7 +1,7 @@
 //! Consumer Agent — generates code from S.DEF.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::io::Write;
 
@@ -11,7 +11,7 @@ use rusqlite::params;
 use cleanroom_db::{Database, DbError, Task, TaskRepository, TaskType};
 
 pub mod code_generator;
-use code_generator::{create_generator, CodeGenerator, GeneratedCode};
+use code_generator::{create_generator, GeneratedCode};
 
 /// Compatibility mode for code generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

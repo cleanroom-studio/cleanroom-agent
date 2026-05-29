@@ -3,9 +3,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use rusqlite::params;
-use tracing::{info, instrument};
+use tracing::instrument;
 
-use cleanroom_db::{Database, DbError, TaskRepository, TaskStatus, TaskType};
+use cleanroom_db::{Database, DbError, TaskRepository, TaskStatus};
 
 /// Coverage score from 0.0 to 1.0.
 #[derive(Debug, Clone)]
@@ -90,7 +90,7 @@ impl CompletenessValidator {
         let pending = doc_tasks.iter().filter(|t| t.status == TaskStatus::Pending).count();
 
         let score = if total > 0 { completed as f64 / total as f64 } else { 0.0 };
-        let mut details = vec![format!("Total tasks: {}, Completed: {}, Failed: {}, Pending: {}", total, completed, failed, pending)];
+        let details = vec![format!("Total tasks: {}, Completed: {}, Failed: {}, Pending: {}", total, completed, failed, pending)];
         let mut warnings = Vec::new();
 
         if failed > 0 { warnings.push(format!("{} tasks failed analysis", failed)); }

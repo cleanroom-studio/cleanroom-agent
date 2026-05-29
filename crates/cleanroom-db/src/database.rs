@@ -121,6 +121,34 @@ impl Database {
         Arc::clone(&self.conn)
     }
 
+    /// Open a database using embedded schema (no filesystem migrations needed).
+    ///
+    /// Useful for testing or environments without access to the migrations directory.
+    /// Applies both the initial schema and sdef storage schema.
+    pub fn open_embedded(path: &Path) -> DbResult<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_FULL_MUTEX;
+
+        let conn = Connection::open_with_flags(path, flags)
+            .map_err(|e| DbError::ConnectionFailed(e.to_string()))?;
+        let db = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        db.configure()?;
+        let conn = db.conn.lock().unwrap();
+        let combined = format!(
+            "{}\n{}",
+            crate::embedded_schema::INITIAL_SCHEMA_SQL,
+            include_str!("../../../migrations/002_sdef_storage.sql"),
+        );
+        conn.execute_batch(&combined)
+            .map_err(|e| DbError::MigrationFailed(e.to_string()))?;
+        drop(conn);
+        info!("Database opened successfully (embedded schema)");
+        Ok(db)
+    }
+
     /// Create an in-memory database for testing.
     pub fn in_memory() -> DbResult<Self> {
         let conn = Connection::open_in_memory()

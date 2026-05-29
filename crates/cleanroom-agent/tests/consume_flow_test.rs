@@ -4,7 +4,6 @@
 //! to produce Rust, TypeScript, and Python output.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use cleanroom_db::Database;
 use cleanroom_db::export_import::SdefImporter;
@@ -27,7 +26,7 @@ fn fixture_path(relative: &str) -> String {
     }
 }
 
-/// Create a temporary file-based database.
+/// Create a temporary file-based database using embedded schema.
 fn create_temp_db() -> (Database, PathBuf) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -36,7 +35,7 @@ fn create_temp_db() -> (Database, PathBuf) {
     let dir = std::env::temp_dir().join(format!("cleanroom_consume_{}", ts));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("state.db");
-    let db = Database::open(&db_path).unwrap();
+    let db = Database::open_embedded(&db_path).unwrap();
     (db, db_path)
 }
 

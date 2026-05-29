@@ -9,7 +9,7 @@ use cleanroom_agent::{
     ConsumerAgent, ConsumerConfig, CompatibilityMode, Fidelity,
     CompatibilityResolver, CompletenessValidator, format_report,
 };
-use cleanroom_db::{Database, TaskRepository, TaskStatus, TaskType};
+use cleanroom_db::{Database, TaskRepository, TaskStatus};
 use cleanroom_i18n::tr_global;
 
 #[derive(Subcommand)]
@@ -337,7 +337,7 @@ fn export_command(document: &str, output: &str, format: &str, db_path: &str) -> 
             row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<String>>(2)?,
         ))
-    ).map_err(|e| anyhow::anyhow!(tr_global!("cli.error_no_doc_in_db")))?;
+    ).map_err(|_e| anyhow::anyhow!(tr_global!("cli.error_no_doc_in_db")))?;
 
     drop(stmt);
 

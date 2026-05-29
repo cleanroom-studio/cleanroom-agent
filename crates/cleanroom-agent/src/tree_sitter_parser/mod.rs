@@ -21,7 +21,7 @@ pub mod python_parser;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use tracing::{info, warn};
 use tree_sitter::Language;
@@ -29,6 +29,7 @@ use tree_sitter::Language;
 use crate::ir_to_sdef::{IrEntity, IrAttribute, IrMethod, IrParam};
 
 /// A tree-sitter language loaded into the parser.
+#[derive(Clone)]
 pub struct LoadedGrammar {
     /// Language name (e.g. "rust", "typescript").
     pub language: String,
@@ -37,18 +38,10 @@ pub struct LoadedGrammar {
 }
 
 
-/// Get the global grammar registry.
+/// Get the global grammar registry using OnceLock (safe, no unsafe needed).
 fn grammar_registry() -> &'static Mutex<HashMap<String, LoadedGrammar>> {
-    // Use Box::leak to create a static reference from a heap allocation.
-    // This is safe because the registry lives for the entire program lifetime.
-    static mut REGISTRY: Option<&Mutex<HashMap<String, LoadedGrammar>>> = None;
-
-    // SAFETY: Single-threaded init at first access; after that read-only.
-    unsafe {
-        REGISTRY.get_or_insert_with(|| {
-            Box::leak(Box::new(Mutex::new(HashMap::new())))
-        })
-    }
+    static REGISTRY: OnceLock<Mutex<HashMap<String, LoadedGrammar>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Register a tree-sitter Language for a language identifier.
@@ -56,8 +49,8 @@ fn grammar_registry() -> &'static Mutex<HashMap<String, LoadedGrammar>> {
 /// Typical usage (requires the `tree-sitter-{lang}` crate):
 ///
 /// ```no_run
-/// let lang = tree_sitter_rust::language();
-/// tree_sitter_parser::register_grammar("rust", lang);
+/// let lang = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
+/// crate::tree_sitter_parser::register_grammar("rust", lang);
 /// ```
 pub fn register_grammar(language: &str, ts_language: Language) {
     let mut registry = grammar_registry().lock().unwrap();
@@ -83,14 +76,16 @@ pub fn has_grammar(language: &str) -> bool {
 /// Call this once during application startup.
 pub fn init_builtin_grammars() {
     // Rust grammar
-    register_grammar("rust", tree_sitter_rust::language());
+    register_grammar("rust", Language::new(tree_sitter_rust::LANGUAGE));
 
-    // TypeScript and JavaScript (both from the typescript crate)
-    register_grammar("typescript", tree_sitter_typescript::language_typescript());
-    register_grammar("javascript", tree_sitter_typescript::language_javascript());
+    // TypeScript grammar
+    register_grammar("typescript", Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT));
+
+    // JavaScript grammar
+    register_grammar("javascript", Language::new(tree_sitter_javascript::LANGUAGE));
 
     // Python grammar
-    register_grammar("python", tree_sitter_python::language());
+    register_grammar("python", Language::new(tree_sitter_python::LANGUAGE));
 
     info!(
         "Initialized built-in tree-sitter grammars: rust, typescript, javascript, python"
@@ -653,13 +648,6 @@ def create_user(name: str) -> User:
             "python",
         );
         assert!(!analysis.entities.is_empty(), "Should extract entities");
-    }
-
-    #[test]
-    fn test_grammar_search_paths() {
-        let paths = grammar_search_paths();
-        assert!(!paths.is_empty(), "Should have at least some search paths");
-        assert!(paths.iter().any(|p| p.to_string_lossy().contains("grammars")));
     }
 
     #[test]

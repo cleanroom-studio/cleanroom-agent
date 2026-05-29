@@ -1,6 +1,6 @@
 //! Code merger — combines generated code from multiple agents into a coherent output.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{info, instrument};
 

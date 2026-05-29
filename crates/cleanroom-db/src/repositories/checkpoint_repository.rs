@@ -2,7 +2,7 @@
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tracing::instrument;
 
 use crate::error::{DbError, DbResult};

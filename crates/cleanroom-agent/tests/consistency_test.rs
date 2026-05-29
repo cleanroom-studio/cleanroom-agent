@@ -6,6 +6,7 @@
 //! - Auto-fix strategies can be applied
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use cleanroom_agent::{
     ConsistencyService, ConsistencyChecker, ConsistencyCheckerConfig,
@@ -63,13 +64,14 @@ fn test_consistency_checker_creation() {
     let checker = ConsistencyChecker::new(
         db.clone(),
         ConsistencyCheckerConfig {
-            check_interval_secs: 60,
-            auto_fix: false,
+            interval: Duration::from_secs(60),
+            document_names: vec!["test-doc".to_string()],
             ..Default::default()
         },
     );
-    assert_eq!(checker.config().check_interval_secs, 60);
-    assert!(!checker.config().auto_fix);
+    // Verify the checker was created successfully (no panic)
+    let result = checker.run_once().unwrap();
+    assert_eq!(result, 0);
 }
 
 #[test]
@@ -77,14 +79,14 @@ fn test_fingerprint_repository_crud() {
     let db = setup_db();
     let repo = FingerprintRepository::from_arc(db.connection_arc());
 
-    // Create fingerprint
+    // Create fingerprint with all hashes matching (consistent)
     let fp = Fingerprint {
         entity_uri: "sdef://test-doc/entity/User".to_string(),
         document_name: "test-doc".to_string(),
         entity_type: "data_model".to_string(),
         sdef_hash: Some("abc123".to_string()),
         db_hash: Some("abc123".to_string()),
-        code_hash: Some("def456".to_string()),
+        code_hash: Some("abc123".to_string()),
         code_path: Some("src/user.rs".to_string()),
         last_checked_at: String::new(),
         last_consistent_at: None,
