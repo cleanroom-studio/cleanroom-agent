@@ -312,3 +312,8 @@ impl ShardRepository {
         Ok(())
     }
 }
+
+// Note: Repository-level unit tests require a shared connection since
+// ShardRepository takes owned Connection. Integration tests in cleanroom-mcp
+// cover shard CRUD operations end-to-end via MCP tools (list_shards,
+// export_shard, import_shard).

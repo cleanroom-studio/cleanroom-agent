@@ -24,3 +24,6 @@ chrono.workspace = true
 rusqlite.workspace = true
 serde_yaml.workspace = true
 futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

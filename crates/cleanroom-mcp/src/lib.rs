@@ -57,6 +57,15 @@ impl CleanroomMcpServer {
         })
     }
 
+    /// Create from an existing Database (useful for testing with in-memory DB).
+    pub fn from_db(db: Arc<Database>, db_path: &Path) -> Self {
+        Self {
+            db,
+            db_path: db_path.to_string_lossy().to_string(),
+            lsp_pool: Arc::new(Mutex::new(LspServerPool::new())),
+        }
+    }
+
     /// Start the server over stdio transport.
     /// Also spawns a background consistency checker loop.
     pub async fn serve(self) -> Result<(), ErrorData> {
@@ -1393,5 +1402,396 @@ impl ServerHandler for CleanroomMcpServer {
                 }
             }
         }
+    }
+}
+
+// ============ Tests ============
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cleanroom_db::Database;
+
+    /// TempDir wrapper that keeps the DB file alive for the test's duration.
+    struct TestEnv {
+        _dir: tempfile::TempDir,
+        server: CleanroomMcpServer,
+    }
+
+    fn setup() -> TestEnv {
+        let dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let path = dir.path().join("test.db");
+        let db = Database::open_embedded(&path).expect("Failed to open embedded DB");
+
+        // Create test document
+        db.connection().execute_batch(
+            "INSERT INTO sdef_documents (name, version, description, created_at, updated_at)
+             VALUES ('test-doc', '1.0', 'Test document', datetime(), datetime());"
+        ).unwrap();
+
+        let server = CleanroomMcpServer::from_db(Arc::new(db), &path);
+        TestEnv { _dir: dir, server }
+    }
+
+    fn call(server: &CleanroomMcpServer, name: &str, args: serde_json::Value) -> serde_json::Value {
+        let params = rmcp::model::CallToolRequestParams::new(name.to_string())
+            .with_arguments(args.as_object().cloned().unwrap_or_default());
+        match server.dispatch_tool_call(params) {
+            Ok(val) => val,
+            Err(e) => panic!("Tool '{}' failed: {}", name, e),
+        }
+    }
+
+    // ======= Task Management Tests =======
+
+    #[test]
+    fn test_create_and_list_tasks() {
+        let env = setup();
+        let server = &env.server;
+
+        let result = call(server, "create_task", serde_json::json!({
+            "task_type": "REPO_ANALYZE",
+            "input": { "path": "/tmp/test" },
+            "priority": 10,
+        }));
+        assert!(result.get("task_id").and_then(|v| v.as_str()).is_some());
+        let task_id = result["task_id"].as_str().unwrap().to_string();
+
+        let list = call(&server, "list_tasks", serde_json::json!({}));
+        let tasks = list.as_array().unwrap();
+        assert!(!tasks.is_empty(), "Should have at least one task");
+        assert!(tasks.iter().any(|t| t["task_id"] == task_id));
+    }
+
+    #[test]
+    fn test_claim_and_complete_task() {
+        let env = setup();
+        let server = &env.server;
+
+        call(&server, "create_task", serde_json::json!({
+            "task_type": "EXTRACT_DATA_MODEL",
+            "input": { "document": "test-doc" },
+        }));
+
+        let claimed = call(&server, "claim_task", serde_json::json!({
+            "agent_id": "test-agent"
+        }));
+        assert!(!claimed.is_null(), "Should claim a task");
+        let task_id = claimed["task_id"].as_str().unwrap().to_string();
+        assert_eq!(claimed["status"], "in_progress");
+
+        let completed = call(&server, "complete_task", serde_json::json!({
+            "task_id": task_id,
+            "output": { "result": "ok" },
+        }));
+        assert_eq!(completed["ok"], true);
+    }
+
+    #[test]
+    fn test_get_task_not_found() {
+        let env = setup();
+        let server = &env.server;
+        let params = rmcp::model::CallToolRequestParams::new("get_task".to_string())
+            .with_arguments(serde_json::json!({"task_id": "nonexistent"}).as_object().cloned().unwrap());
+        let result = server.dispatch_tool_call(params);
+        assert!(result.is_err(), "Non-existent task should error");
+    }
+
+    // ======= S.DEF Query Tests =======
+
+    #[test]
+    fn test_list_documents() {
+        let env = setup();
+        let server = &env.server;
+        let docs = call(&server, "list_documents", serde_json::json!({}));
+        let docs_arr = docs.as_array().unwrap();
+        assert!(!docs_arr.is_empty());
+        assert!(docs_arr.iter().any(|d| d["name"] == "test-doc"));
+    }
+
+    #[test]
+    fn test_data_model_crud() {
+        let env = setup();
+        let server = &env.server;
+        let db = &server.db;
+
+        // Insert a data model directly for testing
+        db.connection().execute_batch(
+            "INSERT INTO data_models (entity, document_name, status, description)
+             VALUES ('TodoItem', 'test-doc', 'active', 'A todo item entity');
+             INSERT INTO data_attributes (document_name, entity, name, attr_type, description, required)
+             VALUES ('test-doc', 'TodoItem', 'title', 'string', 'Task title', 1);"
+        ).unwrap();
+
+        let result = call(&server, "get_data_model", serde_json::json!({
+            "document_name": "test-doc",
+            "entity": "TodoItem",
+        }));
+        assert_eq!(result["entity"], "TodoItem");
+        let attrs = result["attributes"].as_array().unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0]["name"], "title");
+    }
+
+    // ======= Naming Service Tests =======
+
+    #[test]
+    fn test_resolve_name_auto_generates() {
+        let env = setup();
+        let server = &env.server;
+
+        let result = call(&server, "resolve_name", serde_json::json!({
+            "document_name": "test-doc",
+            "sdef_uri": "sdef://test-doc/entity/User",
+            "language": "rust",
+            "symbol_type": "class",
+        }));
+        assert_eq!(result["found"], false, "New name should not be found");
+        assert_eq!(result["is_new"], true, "Should be auto-generated");
+        assert!(result["name"].as_str().unwrap_or("").len() > 0, "Should generate a name");
+
+        // Second call should find cached
+        let cached = call(&server, "resolve_name", serde_json::json!({
+            "document_name": "test-doc",
+            "sdef_uri": "sdef://test-doc/entity/User",
+            "language": "rust",
+            "symbol_type": "class",
+        }));
+        assert_eq!(cached["found"], true, "Cached name should be found");
+        assert_eq!(cached["name"], result["name"], "Should return same name");
+    }
+
+    #[test]
+    fn test_register_custom_name() {
+        let env = setup();
+        let server = &env.server;
+
+        call(&server, "register_custom_name", serde_json::json!({
+            "document_name": "test-doc",
+            "sdef_uri": "sdef://test-doc/entity/MyService",
+            "language": "rust",
+            "symbol_type": "interface",
+            "concrete_name": "my_service",
+        }));
+
+        let result = call(&server, "resolve_name", serde_json::json!({
+            "document_name": "test-doc",
+            "sdef_uri": "sdef://test-doc/entity/MyService",
+            "language": "rust",
+            "symbol_type": "interface",
+        }));
+        assert_eq!(result["name"], "my_service");
+    }
+
+    #[test]
+    fn test_list_symbols() {
+        let env = setup();
+        let server = &env.server;
+
+        // Register a symbol first
+        call(&server, "register_custom_name", serde_json::json!({
+            "document_name": "test-doc",
+            "sdef_uri": "sdef://doc/entity/Item",
+            "language": "typescript",
+            "symbol_type": "class",
+            "concrete_name": "Item",
+        }));
+
+        let symbols = call(&server, "list_symbols", serde_json::json!({
+            "document_name": "test-doc",
+            "language": "typescript",
+        }));
+        let arr = symbols.as_array().unwrap();
+        assert!(!arr.is_empty());
+    }
+
+    // ======= Checkpoint Tests =======
+
+    #[test]
+    fn test_checkpoint_lifecycle() {
+        let env = setup();
+        let server = &env.server;
+
+        // Create a checkpoint
+        let cp = call(&server, "create_checkpoint", serde_json::json!({
+            "document_name": "test-doc",
+            "description": "Test checkpoint",
+        }));
+        let cp_id = cp["checkpoint_id"].as_str().unwrap().to_string();
+        assert!(!cp_id.is_empty());
+
+        // List checkpoints
+        let list = call(&server, "list_checkpoints", serde_json::json!({
+            "document_name": "test-doc",
+        }));
+        let cps = list.as_array().unwrap();
+        assert!(cps.iter().any(|c| c["checkpoint_id"] == cp_id));
+
+        // Create a task, then restore
+        call(&server, "create_task", serde_json::json!({
+            "task_type": "REPO_ANALYZE",
+            "input": { "doc": "test-doc" },
+        }));
+
+        let restore = call(&server, "restore_checkpoint", serde_json::json!({
+            "checkpoint_id": cp_id,
+        }));
+        assert_eq!(restore["ok"], true);
+    }
+
+    // ======= Consistency Tests =======
+
+    #[test]
+    fn test_check_consistency_empty() {
+        let env = setup();
+        let server = &env.server;
+        let result = call(&server, "check_consistency", serde_json::json!({
+            "document_name": "test-doc",
+        }));
+        assert_eq!(result["consistent"], true, "No fingerprints = consistent");
+        assert_eq!(result["inconsistent_count"], 0);
+    }
+
+    #[test]
+    fn test_compute_fingerprints() {
+        let env = setup();
+        let server = &env.server;
+        let db = &server.db;
+
+        // Add data models
+        db.connection().execute_batch(
+            "INSERT INTO data_models (entity, document_name, status, description)
+             VALUES ('User', 'test-doc', 'active', 'User entity');
+             INSERT INTO data_attributes (document_name, entity, name, attr_type)
+             VALUES ('test-doc', 'User', 'id', 'UUID');
+             INSERT INTO contracts (name, document_name, contract_type, description)
+             VALUES ('UserService', 'test-doc', 'interface', 'User service interface');"
+        ).unwrap();
+
+        let result = call(&server, "compute_fingerprints", serde_json::json!({
+            "document_name": "test-doc",
+        }));
+        let count = result["fingerprint_count"].as_i64().unwrap_or(0);
+        assert!(count >= 2, "Should compute fingerprints for data models + contracts");
+
+        // Now check consistency should find them
+        let check = call(&server, "check_consistency", serde_json::json!({
+            "document_name": "test-doc",
+        }));
+        assert_eq!(check["consistent"], true, "Fresh fingerprints = consistent");
+    }
+
+    // ======= Import/Export Tests =======
+
+    #[test]
+    fn test_export_sdef() {
+        let env = setup();
+        let server = &env.server;
+        server.db.connection().execute_batch(
+            "INSERT INTO data_models (entity, document_name, status, description)
+             VALUES ('Task', 'test-doc', 'active', 'A task');"
+        ).unwrap();
+
+        let result = call(server, "export_sdef", serde_json::json!({
+            "document_name": "test-doc",
+        }));
+        let content = result["sdef_content"].as_str().unwrap();
+        assert!(content.contains("Task"), "Exported S.DEF should contain the data model");
+    }
+
+    #[test]
+    fn test_export_import_roundtrip() {
+        let env = setup();
+        let server = &env.server;
+        let db = &server.db;
+
+        // Export the (mostly) empty test document
+        let exported = call(&server, "export_sdef", serde_json::json!({
+            "document_name": "test-doc",
+        }));
+        let json_str = exported["sdef_content"].as_str().unwrap().to_string();
+
+        // Import into a new doc
+        let imported = call(&server, "import_sdef", serde_json::json!({
+            "sdef_json": json_str,
+        }));
+        assert_eq!(imported["ok"], true);
+    }
+
+    // ======= Error Handling Tests =======
+
+    #[test]
+    fn test_unknown_tool_errors() {
+        let env = setup();
+        let server = &env.server;
+        let params = rmcp::model::CallToolRequestParams::new("nonexistent_tool".to_string());
+        let result = server.dispatch_tool_call(params);
+        assert!(result.is_err(), "Unknown tool should produce error");
+        let err = result.unwrap_err();
+        assert!(err.contains("Unknown tool"), "Error should mention unknown tool");
+    }
+
+    #[test]
+    fn test_get_contract_not_found() {
+        let env = setup();
+        let server = &env.server;
+        let params = rmcp::model::CallToolRequestParams::new("get_contract".to_string())
+            .with_arguments(serde_json::json!({
+                "document_name": "test-doc",
+                "name": "NonExistent",
+            }).as_object().cloned().unwrap());
+        let result = server.dispatch_tool_call(params);
+        assert!(result.is_err(), "Non-existent contract should error");
+    }
+
+    // ======= Dependency Graph Tests =======
+
+    #[test]
+    fn test_get_dependency_graph() {
+        let env = setup();
+        let server = &env.server;
+        let db = &server.db;
+
+        db.connection().execute(
+            "INSERT INTO data_models (entity, document_name, status) VALUES (?1, ?2, 'active')",
+            rusqlite::params!["Order", "test-doc"],
+        ).unwrap();
+        db.connection().execute(
+            "INSERT INTO data_relationships (document_name, entity, kind, target)
+             VALUES ('test-doc', 'Order', 'belongs_to', 'User');",
+            [],
+        ).unwrap();
+
+        let result = call(server, "get_dependency_graph", serde_json::json!({
+            "document_name": "test-doc",
+        }));
+        assert_eq!(result["document_name"], "test-doc");
+        let edges = result["edges"].as_array().unwrap();
+        assert!(edges.len() >= 1, "Should have at least one relationship edge");
+    }
+
+    // ======= Shard Tool Tests =======
+
+    #[test]
+    fn test_list_shards() {
+        let env = setup();
+        let server = &env.server;
+        let result = call(&server, "list_shards", serde_json::json!({
+            "document_name": "test-doc",
+        }));
+        // Should succeed with empty list
+        assert!(result.is_array() || result.as_array().is_some());
+    }
+
+    // ======= Search Tests =======
+
+    #[test]
+    fn test_search_sdef() {
+        let env = setup();
+        let server = &env.server;
+        let _result = call(&server, "search_sdef", serde_json::json!({
+            "query": "test",
+        }));
+        // FTS5 search may or may not find results; tool should not error
     }
 }
