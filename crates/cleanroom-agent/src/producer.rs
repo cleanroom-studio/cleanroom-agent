@@ -45,9 +45,12 @@ impl Default for ProducerConfig {
                 "javascript".to_string(),
                 "python".to_string(),
                 "rust".to_string(),
+                "c".to_string(),
+                "cpp".to_string(),
                 "go".to_string(),
+                "java".to_string(),
             ],
-            lsp_enabled: true,
+            lsp_enabled: false, // Disabled by default; enable with --lsp flag
         }
     }
 }

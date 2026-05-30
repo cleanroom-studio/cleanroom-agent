@@ -36,7 +36,8 @@ pub struct RustGenerator;
 impl CodeGenerator for RustGenerator {
     fn generate_data_model(&self, model: &DataModel) -> Vec<GeneratedCode> {
         let mut output = String::new();
-        
+        output.push_str("use crate::*;\n\n");
+
         // Deduplicate attributes by name to avoid duplicate field definitions
         let deduped_attrs: Vec<&sdef_core::DataAttribute> = model.attributes.as_ref()
             .map(|attrs| {
@@ -44,7 +45,12 @@ impl CodeGenerator for RustGenerator {
                 attrs.iter().filter(|a| seen.insert(a.name.as_str())).collect()
             })
             .unwrap_or_default();
-        
+
+        // Genereate #[derive] BEFORE struct definition (required by Rust)
+        if !deduped_attrs.is_empty() {
+            output.push_str("#[derive(serde::Serialize, serde::Deserialize)]\n");
+        }
+
         // Generate struct
         if let Some(desc) = &model.description {
             output.push_str("/// ");
@@ -74,10 +80,12 @@ impl CodeGenerator for RustGenerator {
         output.push_str(&format!("\nimpl {} {{\n", to_pascal_case(&model.entity)));
         output.push_str("    /// Create a new instance.\n");
         output.push_str("    pub fn new(");
-        
-        // Constructor params (skip generated/internal)
+
+        // Constructor params (skip generated/internal + auto-fields)
         let ctor_params: Vec<String> = deduped_attrs.iter()
-            .filter(|a| !a.generated && !a.internal)
+            .filter(|a| !a.generated && !a.internal
+                && a.name != "id"
+                && a.name != "created_at")
             .map(|attr| {
                 format!("{}: {}", to_snake_case(&attr.name), rust_type(&attr.attr_type, attr.required))
             })
@@ -85,20 +93,21 @@ impl CodeGenerator for RustGenerator {
         output.push_str(&ctor_params.join(", "));
         output.push_str(") -> Self {\n");
         output.push_str(&format!("        Self {{\n"));
-        // Constructor body — only assign non-generated, non-internal fields
+        // Constructor body — non-generated, non-internal fields + defaults for auto-fields
         for attr in deduped_attrs.iter().filter(|a| !a.generated && !a.internal) {
-            output.push_str(&format!(
-                "            {}: {},\n",
-                to_snake_case(&attr.name),
-                to_snake_case(&attr.name)
-            ));
+            if attr.name == "id" {
+                output.push_str("            id: uuid::Uuid::new_v4(),\n");
+            } else if attr.name == "created_at" {
+                output.push_str("            created_at: Some(chrono::Utc::now()),\n");
+            } else {
+                output.push_str(&format!(
+                    "            {}: {},\n",
+                    to_snake_case(&attr.name),
+                    to_snake_case(&attr.name)
+                ));
+            }
         }
         output.push_str("        }\n    }\n}\n");
-        
-        // Generate serde derive
-        if model.attributes.as_ref().map_or(false, |a| !a.is_empty()) {
-            output.push_str("\n#[derive(serde::Serialize, serde::Deserialize)]\n");
-        }
         
         vec![GeneratedCode {
             file_path: format!("{}.rs", to_snake_case(&model.entity)),
@@ -325,8 +334,11 @@ fn rust_type(sdef_type: &str, required: bool) -> String {
         let inner_rust = rust_type(inner, true);
         if inner_rust == "String" || inner_rust == "i8" {
             "String".to_string()
+        } else if inner_rust.starts_with('[') {
+            // Array type: Vec already handled
+            format!("Vec<{}>", inner_rust.trim_start_matches('[').trim_end_matches(']'))
         } else {
-            format!("Box<{}>", inner_rust)
+            format!("Option<Box<{}>>", inner_rust)
         }
     } else {
         let s = match trimmed {
@@ -334,29 +346,42 @@ fn rust_type(sdef_type: &str, required: bool) -> String {
             "string" | "text" | "varchar" | "sds" => "String",
             "char" => "i8",
             "unsigned char" => "u8",
-            // Signed integers
+            // Signed integers (standard C)
             "integer" | "int" | "int32" => "i32",
             "int8" | "signed char" => "i8",
             "int16" | "short" | "short int" => "i16",
             "int64" | "bigint" | "long" | "long int" | "long long" | "long long int" => "i64",
-            // Unsigned integers
+            // C99 stdint.h fixed-width types (lowercase)
+            "int8_t" => "i8",
+            "int16_t" => "i16",
+            "int32_t" => "i32",
+            "int64_t" => "i64",
+            // Unsigned integers (standard C)
             "uint" | "unsigned" | "unsigned int" => "u32",
             "uint8" => "u8",
             "uint16" | "unsigned short" | "unsigned short int" => "u16",
             "uint32" => "u32",
             "uint64" | "unsigned long" | "unsigned long int" | "u64" | "unsigned long long" | "unsigned long long int" => "u64",
             "size_t" | "usize" => "usize",
+            "ssize_t" => "isize",
+            // C99 stdint.h unsigned fixed-width types (lowercase)
+            "uint8_t" => "u8",
+            "uint16_t" => "u16",
+            "uint32_t" => "u32",
+            "uint64_t" => "u64",
             // Floating point
             "float" => "f32",
             "double" | "long double" | "decimal" => "f64",
             // Boolean
-            "boolean" | "bool" => "bool",
+            "boolean" | "bool" | "_bool" | "boolean_t" => "bool",
             // UUID
             "uuid" => "uuid::Uuid",
             // Time
             "timestamp" | "datetime" => "chrono::DateTime<chrono::Utc>",
             "date" => "chrono::NaiveDate",
             "time_t" => "i64",
+            "mstime_t" | "monotime" => "u64",
+            "lu_byte" => "u8",
             // Complex types
             "json" | "jsonb" => "serde_json::Value",
             "bytes" | "bytea" => "Vec<u8>",
@@ -365,7 +390,6 @@ fn rust_type(sdef_type: &str, required: bool) -> String {
             // Everything else: treat as a named type reference (PascalCase)
             other => {
                 let pascal = to_pascal_case(other);
-                // Return boxed type reference since we need a uniform type
                 return pascal;
             }
         };

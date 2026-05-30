@@ -31,7 +31,7 @@
 //! let db = Arc::new(Database::open(&std::path::PathBuf::from("state.db"))?);
 //! let scheduler = Scheduler::new(db);
 //!
-//! let plan = TaskPlan::analysis_plan("my-project");
+//! let plan = TaskPlan::analysis_plan("my-project", ".");
 //! let task_ids = scheduler.create_from_plan(&plan)?;
 //! println!("Created {} tasks", task_ids.len());
 //!
@@ -62,7 +62,7 @@ use tracing::{info, warn, instrument};
 /// use cleanroom_agent::scheduler::{TaskPlan, TaskTemplate};
 /// use cleanroom_db::TaskType;
 ///
-/// let plan = TaskPlan::analysis_plan("my-project");
+/// let plan = TaskPlan::analysis_plan("my-project", ".");
 /// for (i, group) in plan.priority_groups.iter().enumerate() {
 ///     println!("Priority group {}: {} tasks", i, group.len());
 /// }
@@ -95,14 +95,19 @@ pub struct TaskTemplate {
 
 impl TaskPlan {
     /// Create a standard analysis plan for a given document.
-    pub fn analysis_plan(document_name: &str) -> Self {
+    pub fn analysis_plan(document_name: &str, repo_path: &str) -> Self {
+        let input = serde_json::json!({
+            "document": document_name,
+            "repo_path": repo_path,
+            "project_name": document_name,
+        });
         Self {
             priority_groups: vec![
                 // Priority 10: Repo scan (no dependencies)
                 vec![TaskTemplate {
                     task_type: TaskType::RepoAnalyze,
                     priority: 10,
-                    input: serde_json::json!({"document": document_name}),
+                    input: input.clone(),
                     dependency_indices: vec![],
                     max_retries: 3,
                 }],
@@ -111,14 +116,14 @@ impl TaskPlan {
                     TaskTemplate {
                         task_type: TaskType::ExtractMetadata,
                         priority: 8,
-                        input: serde_json::json!({"document": document_name}),
+                        input: input.clone(),
                         dependency_indices: vec![0], // repo scan
                         max_retries: 3,
                     },
                     TaskTemplate {
                         task_type: TaskType::ExtractArchitecture,
                         priority: 8,
-                        input: serde_json::json!({"document": document_name}),
+                        input: input.clone(),
                         dependency_indices: vec![0],
                         max_retries: 3,
                     },
@@ -128,14 +133,14 @@ impl TaskPlan {
                     TaskTemplate {
                         task_type: TaskType::ExtractDataModel,
                         priority: 6,
-                        input: serde_json::json!({"document": document_name}),
+                        input: input.clone(),
                         dependency_indices: vec![0],
                         max_retries: 3,
                     },
                     TaskTemplate {
                         task_type: TaskType::ExtractModule,
                         priority: 6,
-                        input: serde_json::json!({"document": document_name}),
+                        input: input.clone(),
                         dependency_indices: vec![0],
                         max_retries: 3,
                     },
@@ -144,7 +149,7 @@ impl TaskPlan {
                 vec![TaskTemplate {
                     task_type: TaskType::ExtractUi,
                     priority: 5,
-                    input: serde_json::json!({"document": document_name}),
+                    input: input.clone(),
                     dependency_indices: vec![0],
                     max_retries: 3,
                 }],
@@ -153,14 +158,14 @@ impl TaskPlan {
                     TaskTemplate {
                         task_type: TaskType::ExtractTests,
                         priority: 4,
-                        input: serde_json::json!({"document": document_name}),
+                        input: input.clone(),
                         dependency_indices: vec![0],
                         max_retries: 3,
                     },
                     TaskTemplate {
                         task_type: TaskType::InferDesignDecisions,
                         priority: 4,
-                        input: serde_json::json!({"document": document_name}),
+                        input: input.clone(),
                         dependency_indices: vec![0],
                         max_retries: 3,
                     },
@@ -169,7 +174,7 @@ impl TaskPlan {
                 vec![TaskTemplate {
                     task_type: TaskType::ValidateShard,
                     priority: 2,
-                    input: serde_json::json!({"document": document_name}),
+                    input: input.clone(),
                     dependency_indices: vec![0, 1, 2, 3, 4, 5, 6, 7],
                     max_retries: 5,
                 }],
@@ -180,12 +185,16 @@ impl TaskPlan {
 
     /// Create a standard code generation plan.
     pub fn generation_plan(document_name: &str) -> Self {
+        let input = serde_json::json!({
+            "document": document_name,
+            "project_name": document_name,
+        });
         Self {
             priority_groups: vec![
                 vec![TaskTemplate {
                     task_type: TaskType::ImportSdef,
                     priority: 10,
-                    input: serde_json::json!({"document": document_name}),
+                    input: input.clone(),
                     dependency_indices: vec![],
                     max_retries: 3,
                 }],
@@ -193,7 +202,7 @@ impl TaskPlan {
                     TaskTemplate {
                         task_type: TaskType::GenerateCode,
                         priority: 8,
-                        input: serde_json::json!({"document": document_name, "scope": "all"}),
+                        input: { let mut inp = input.clone(); inp["scope"] = serde_json::json!("all"); inp },
                         dependency_indices: vec![0],
                         max_retries: 3,
                     },
@@ -203,21 +212,21 @@ impl TaskPlan {
                     TaskTemplate {
                         task_type: TaskType::ValidateDataModel,
                         priority: 7,
-                        input: serde_json::json!({"document": document_name}),
+                        input: input.clone(),
                         dependency_indices: vec![1],
                         max_retries: 3,
                     },
                     TaskTemplate {
                         task_type: TaskType::ValidateCrossFile,
                         priority: 7,
-                        input: serde_json::json!({"document": document_name}),
+                        input: input.clone(),
                         dependency_indices: vec![1],
                         max_retries: 3,
                     },
                     TaskTemplate {
                         task_type: TaskType::RoundtripVerify,
                         priority: 6,
-                        input: serde_json::json!({"document": document_name}),
+                        input: input.clone(),
                         dependency_indices: vec![1, 2, 3],
                         max_retries: 2,
                     },
@@ -225,14 +234,14 @@ impl TaskPlan {
                 vec![TaskTemplate {
                     task_type: TaskType::MergeCode,
                     priority: 5,
-                    input: serde_json::json!({"document": document_name}),
+                    input: input.clone(),
                     dependency_indices: vec![1, 2],
                     max_retries: 3,
                 }],
                 vec![TaskTemplate {
                     task_type: TaskType::RunTests,
                     priority: 4,
-                    input: serde_json::json!({"document": document_name}),
+                    input: input.clone(),
                     dependency_indices: vec![5],
                     max_retries: 5,
                 }],
@@ -464,7 +473,7 @@ mod tests {
     #[test]
     fn test_analysis_plan_creation() {
         let (_, scheduler) = setup();
-        let plan = TaskPlan::analysis_plan("test-doc");
+        let plan = TaskPlan::analysis_plan("test-doc", ".");
         let ids = scheduler.create_from_plan(&plan).unwrap();
         // Analysis plan should create: repo_analyze + extract_metadata + extract_arch + data_model + extract_module + ui + tests + design_decisions + validate
         assert_eq!(ids.len(), 9, "Should create 9 tasks");
@@ -482,7 +491,7 @@ mod tests {
     #[test]
     fn test_progress_summary() {
         let (_, scheduler) = setup();
-        let plan = TaskPlan::analysis_plan("test-doc");
+        let plan = TaskPlan::analysis_plan("test-doc", ".");
         scheduler.create_from_plan(&plan).unwrap();
         let progress = scheduler.get_progress().unwrap();
         assert_eq!(progress.total, 9);
@@ -492,7 +501,7 @@ mod tests {
     #[test]
     fn test_retry_failed_tasks() {
         let (db, scheduler) = setup();
-        let plan = TaskPlan::analysis_plan("test-doc");
+        let plan = TaskPlan::analysis_plan("test-doc", ".");
         scheduler.create_from_plan(&plan).unwrap();
 
         // Mark all tasks as failed

@@ -65,6 +65,7 @@ impl Default for ScanConfig {
                 "vendor".to_string(),
                 ".siefignore".to_string(),
                 "*.lock".to_string(),
+                "tests/fixtures".to_string(),
             ],
             include_dotfiles: false,
             max_file_size: 1_000_000, // 1MB

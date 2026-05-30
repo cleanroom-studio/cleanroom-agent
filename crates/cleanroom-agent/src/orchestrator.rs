@@ -109,7 +109,10 @@ impl Orchestrator {
     /// Create initial tasks for repository analysis.
     #[instrument(skip(self))]
     pub async fn create_initial_tasks(&self) -> Result<Vec<String>, cleanroom_db::DbError> {
-        let plan = TaskPlan::analysis_plan(&self.config.project_name);
+        let plan = TaskPlan::analysis_plan(
+            &self.config.project_name,
+            &self.config.repo_path.to_string_lossy(),
+        );
         let task_ids = self.scheduler.create_from_plan(&plan)?;
         info!(count = task_ids.len(), "Created initial analysis tasks");
         Ok(task_ids)
