@@ -8,8 +8,7 @@
 //!
 //! With auto-diagnose → fix → retry cycling.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

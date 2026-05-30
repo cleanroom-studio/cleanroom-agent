@@ -75,34 +75,56 @@ impl Default for ScanConfig {
 /// File extension → language mapping.
 fn detect_language(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_lowercase();
+
+    // Handle special filename-based detection
+    let filename = path.file_name()?.to_str()?.to_lowercase();
+    if filename == "dockerfile" {
+        return Some("dockerfile".to_string());
+    }
+
     let lang = match ext.as_str() {
         "rs" => "rust",
-        "ts" | "tsx" => "typescript",
+        "ts" | "tsx" | "mts" | "cts" => "typescript",
         "js" | "jsx" | "mjs" | "cjs" => "javascript",
-        "py" | "pyi" => "python",
+        "py" | "pyi" | "pyx" => "python",
         "go" => "go",
         "java" => "java",
         "kt" | "kts" => "kotlin",
         "swift" => "swift",
-        "rb" => "ruby",
+        "rb" | "rake" | "gemspec" | "ru" => "ruby",
         "php" => "php",
         "cs" => "csharp",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
+        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" => "cpp",
+        "lua" => "lua",
+        "dart" => "dart",
         "vue" => "vue",
         "svelte" => "svelte",
+        "astro" => "astro",
         "scala" | "sc" => "scala",
+        "clj" | "cljs" | "cljc" | "edn" => "clojure",
         "ex" | "exs" => "elixir",
-        "sh" | "bash" | "zsh" => "shell",
+        "gleam" => "gleam",
+        "elm" => "elm",
+        "hs" | "lhs" => "haskell",
+        "jl" => "julia",
+        "ml" | "mli" => "ocaml",
+        "fs" | "fsi" | "fsx" | "fsscript" => "fsharp",
+        "nix" => "nix",
+        "zig" | "zon" => "zig",
+        "tf" | "tfvars" => "terraform",
+        "typ" | "typc" => "typst",
+        "prisma" => "prisma",
+        "sh" | "bash" | "zsh" | "ksh" => "shell",
         "yaml" | "yml" => "yaml",
-        "json" => "json",
+        "json" | "jsonc" => "json",
         "toml" => "toml",
+        "xml" | "xsl" | "xsd" => "xml",
         "md" | "mdx" => "markdown",
         "sql" => "sql",
         "html" | "htm" => "html",
         "css" | "scss" | "sass" | "less" => "css",
-        "dockerfile" => "dockerfile",
-        "proto" => "protobuf",
+        "proto" | "protobuf" => "protobuf",
         _ => return None,
     };
     Some(lang.to_string())

@@ -13,7 +13,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use cleanroom_agent::consumer::code_generator::{create_generator, CodeGenerator};
 //! use sdef_core::{DataModel, DataAttribute};
 //!

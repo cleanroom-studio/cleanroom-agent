@@ -154,45 +154,68 @@ impl fmt::Debug for LspServerHandle {
     }
 }
 
-/// Default LSP configurations.
+/// Default LSP configurations covering all major languages.
+/// Matches the OpenCode supported LSP list.
 pub fn default_lsp_configs() -> Vec<LspConfig> {
     vec![
-        LspConfig {
-            language_id: "typescript".to_string(),
-            command: "typescript-language-server".to_string(),
-            args: vec!["--stdio".to_string()],
-            extensions: vec!["ts".to_string(), "tsx".to_string(), "js".to_string(), "jsx".to_string()],
-            idle_timeout_secs: 300,
-        },
-        LspConfig {
-            language_id: "rust".to_string(),
-            command: "rust-analyzer".to_string(),
-            args: vec![],
-            extensions: vec!["rs".to_string()],
-            idle_timeout_secs: 600,
-        },
-        LspConfig {
-            language_id: "python".to_string(),
-            command: "pyright-langserver".to_string(),
-            args: vec!["--stdio".to_string()],
-            extensions: vec!["py".to_string()],
-            idle_timeout_secs: 300,
-        },
-        LspConfig {
-            language_id: "go".to_string(),
-            command: "gopls".to_string(),
-            args: vec![],
-            extensions: vec!["go".to_string()],
-            idle_timeout_secs: 600,
-        },
-        // C / C++
-        LspConfig {
-            language_id: "c".to_string(),
-            command: "clangd".to_string(),
-            args: vec![],
-            extensions: vec!["c".to_string(), "h".to_string()],
-            idle_timeout_secs: 600,
-        },
+        // ── Compiled Languages ──
+        LspConfig { language_id: "rust".into(), command: "rust-analyzer".into(), args: vec![], extensions: vec!["rs".into()], idle_timeout_secs: 600 },
+        LspConfig { language_id: "c".into(), command: "clangd".into(), args: vec![], extensions: vec!["c".into(), "h".into(), "cpp".into(), "hpp".into(), "cc".into(), "cxx".into()], idle_timeout_secs: 600 },
+        LspConfig { language_id: "go".into(), command: "gopls".into(), args: vec![], extensions: vec!["go".into()], idle_timeout_secs: 600 },
+        LspConfig { language_id: "java".into(), command: "jdtls".into(), args: vec![], extensions: vec!["java".into()], idle_timeout_secs: 600 },
+
+        // ── .NET ──
+        LspConfig { language_id: "csharp".into(), command: "csharp-ls".into(), args: vec!["--stdio".into()], extensions: vec!["cs".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "fsharp".into(), command: "fsautocomplete".into(), args: vec![], extensions: vec!["fs".into(), "fsi".into(), "fsx".into()], idle_timeout_secs: 300 },
+
+        // ── Apple ──
+        LspConfig { language_id: "swift".into(), command: "sourcekit-lsp".into(), args: vec![], extensions: vec!["swift".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "objc".into(), command: "clangd".into(), args: vec![], extensions: vec!["m".into(), "mm".into()], idle_timeout_secs: 300 },
+
+        // ── JVM ──
+        LspConfig { language_id: "kotlin".into(), command: "kotlin-language-server".into(), args: vec![], extensions: vec!["kt".into(), "kts".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "scala".into(), command: "metals".into(), args: vec![], extensions: vec!["scala".into(), "sc".into()], idle_timeout_secs: 300 },
+
+        // ── Scripting / Dynamic ──
+        LspConfig { language_id: "python".into(), command: "pyright-langserver".into(), args: vec!["--stdio".into()], extensions: vec!["py".into(), "pyi".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "ruby".into(), command: "ruby-lsp".into(), args: vec![], extensions: vec!["rb".into(), "rake".into(), "gemspec".into(), "ru".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "php".into(), command: "intelephense".into(), args: vec!["--stdio".into()], extensions: vec!["php".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "lua".into(), command: "lua-language-server".into(), args: vec![], extensions: vec!["lua".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "elixir".into(), command: "elixir-ls".into(), args: vec![], extensions: vec!["ex".into(), "exs".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "clojure".into(), command: "clojure-lsp".into(), args: vec![], extensions: vec!["clj".into(), "cljs".into(), "cljc".into(), "edn".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "dart".into(), command: "dart".into(), args: vec!["language-server".into()], extensions: vec!["dart".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "haskell".into(), command: "haskell-language-server-wrapper".into(), args: vec![], extensions: vec!["hs".into(), "lhs".into()], idle_timeout_secs: 600 },
+        LspConfig { language_id: "ocaml".into(), command: "ocamllsp".into(), args: vec![], extensions: vec!["ml".into(), "mli".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "gleam".into(), command: "gleam".into(), args: vec!["lsp".into()], extensions: vec!["gleam".into()], idle_timeout_secs: 300 },
+
+        // ── TypeScript / Web ──
+        LspConfig { language_id: "typescript".into(), command: "typescript-language-server".into(), args: vec!["--stdio".into()], extensions: vec!["ts".into(), "tsx".into(), "js".into(), "jsx".into(), "mjs".into(), "cjs".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "deno".into(), command: "deno".into(), args: vec!["lsp".into()], extensions: vec!["ts".into(), "tsx".into(), "js".into(), "jsx".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "vue".into(), command: "vue-language-server".into(), args: vec!["--stdio".into()], extensions: vec!["vue".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "svelte".into(), command: "svelteserver".into(), args: vec!["--stdio".into()], extensions: vec!["svelte".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "astro".into(), command: "astro-ls".into(), args: vec!["--stdio".into()], extensions: vec!["astro".into()], idle_timeout_secs: 300 },
+
+        // ── Linting ──
+        LspConfig { language_id: "eslint".into(), command: "vscode-eslint-language-server".into(), args: vec!["--stdio".into()], extensions: vec!["ts".into(), "tsx".into(), "js".into(), "jsx".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "oxlint".into(), command: "oxlint".into(), args: vec!["--lsp".into()], extensions: vec!["ts".into(), "tsx".into(), "js".into(), "jsx".into()], idle_timeout_secs: 300 },
+
+        // ── Config / Data ──
+        LspConfig { language_id: "json".into(), command: "vscode-json-languageserver".into(), args: vec!["--stdio".into()], extensions: vec!["json".into(), "jsonc".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "yaml".into(), command: "yaml-language-server".into(), args: vec!["--stdio".into()], extensions: vec!["yaml".into(), "yml".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "toml".into(), command: "taplo".into(), args: vec!["lsp".into(), "stdio".into()], extensions: vec!["toml".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "sql".into(), command: "sql-language-server".into(), args: vec!["up".into(), "--method".into(), "stdio".into()], extensions: vec!["sql".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "prisma".into(), command: "prisma-language-server".into(), args: vec!["--stdio".into()], extensions: vec!["prisma".into()], idle_timeout_secs: 300 },
+
+        // ── Infrastructure ──
+        LspConfig { language_id: "shell".into(), command: "bash-language-server".into(), args: vec!["start".into()], extensions: vec!["sh".into(), "bash".into(), "zsh".into(), "ksh".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "docker".into(), command: "docker-langserver".into(), args: vec!["--stdio".into()], extensions: vec!["dockerfile".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "terraform".into(), command: "terraform-ls".into(), args: vec!["serve".into()], extensions: vec!["tf".into(), "tfvars".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "nix".into(), command: "nixd".into(), args: vec![], extensions: vec!["nix".into()], idle_timeout_secs: 300 },
+
+        // ── Emerging Languages ──
+        LspConfig { language_id: "zig".into(), command: "zls".into(), args: vec![], extensions: vec!["zig".into(), "zon".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "julia".into(), command: "julia".into(), args: vec!["--startup-file=no".into(), "--history-file=no".into(), "-e".into(), "using LanguageServer; runserver()".into()], extensions: vec!["jl".into()], idle_timeout_secs: 300 },
+        LspConfig { language_id: "typst".into(), command: "tinymist".into(), args: vec![], extensions: vec!["typ".into(), "typc".into()], idle_timeout_secs: 300 },
     ]
 }
 

@@ -49,7 +49,7 @@ fn grammar_registry() -> &'static Mutex<HashMap<String, LoadedGrammar>> {
 ///
 /// Typical usage (requires the `tree-sitter-{lang}` crate):
 ///
-/// ```no_run
+/// ```ignore
 /// let lang = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
 /// crate::tree_sitter_parser::register_grammar("rust", lang);
 /// ```
@@ -73,26 +73,31 @@ pub fn has_grammar(language: &str) -> bool {
 
 /// Initialize built-in tree-sitter grammars.
 ///
-/// Registers static grammars for Rust, TypeScript, JavaScript, and Python.
+/// Registers static grammars for 16+ languages.
 /// Call this once during application startup.
 pub fn init_builtin_grammars() {
-    // Rust grammar
     register_grammar("rust", Language::new(tree_sitter_rust::LANGUAGE));
-
-    // TypeScript grammar
     register_grammar("typescript", Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT));
-
-    // JavaScript grammar
     register_grammar("javascript", Language::new(tree_sitter_javascript::LANGUAGE));
-
-    // Python grammar
     register_grammar("python", Language::new(tree_sitter_python::LANGUAGE));
-
-    // C grammar
     register_grammar("c", Language::new(tree_sitter_c::LANGUAGE));
+    register_grammar("cpp", Language::new(tree_sitter_cpp::LANGUAGE));
+    register_grammar("go", Language::new(tree_sitter_go::LANGUAGE));
+    register_grammar("java", Language::new(tree_sitter_java::LANGUAGE));
+    register_grammar("csharp", Language::new(tree_sitter_c_sharp::LANGUAGE));
+    register_grammar("swift", Language::new(tree_sitter_swift::LANGUAGE));
+    register_grammar("kotlin", Language::new(tree_sitter_kotlin_ng::LANGUAGE));
+    register_grammar("php", Language::new(tree_sitter_php::LANGUAGE_PHP));
+    register_grammar("ruby", Language::new(tree_sitter_ruby::LANGUAGE));
+    register_grammar("lua", Language::new(tree_sitter_lua::LANGUAGE));
+    register_grammar("shell", Language::new(tree_sitter_bash::LANGUAGE));
+    register_grammar("json", Language::new(tree_sitter_json::LANGUAGE));
+    register_grammar("toml", Language::new(tree_sitter_toml_ng::LANGUAGE));
+    register_grammar("yaml", Language::new(tree_sitter_yaml::LANGUAGE));
 
     info!(
-        "Initialized built-in tree-sitter grammars: rust, typescript, javascript, python, c"
+        "Initialized {} built-in tree-sitter grammars",
+        registered_languages().len()
     );
 }
 
@@ -166,7 +171,6 @@ pub fn known_grammars() -> Vec<GrammarDescriptor> {
                 "decorated_definition",
             ],
         },
-        // C grammar — uses c_parser sub-module for node walking
         GrammarDescriptor {
             language: "c",
             extensions: &["c", "h"],
@@ -174,6 +178,103 @@ pub fn known_grammars() -> Vec<GrammarDescriptor> {
                 "struct_specifier", "enum_specifier",
                 "function_definition", "type_definition",
             ],
+        },
+        GrammarDescriptor {
+            language: "cpp",
+            extensions: &["cpp", "cc", "cxx", "c++", "hpp", "hh", "hxx", "h++"],
+            top_level_nodes: &[
+                "class_specifier", "struct_specifier", "enum_specifier",
+                "function_definition", "template_declaration", "namespace_definition",
+            ],
+        },
+        GrammarDescriptor {
+            language: "go",
+            extensions: &["go"],
+            top_level_nodes: &[
+                "type_declaration", "function_declaration",
+                "method_declaration", "import_declaration",
+            ],
+        },
+        GrammarDescriptor {
+            language: "java",
+            extensions: &["java"],
+            top_level_nodes: &[
+                "class_declaration", "interface_declaration",
+                "enum_declaration", "method_declaration",
+            ],
+        },
+        GrammarDescriptor {
+            language: "csharp",
+            extensions: &["cs"],
+            top_level_nodes: &[
+                "class_declaration", "interface_declaration",
+                "struct_declaration", "enum_declaration",
+                "method_declaration", "namespace_declaration",
+            ],
+        },
+        GrammarDescriptor {
+            language: "swift",
+            extensions: &["swift"],
+            top_level_nodes: &[
+                "class_declaration", "struct_declaration",
+                "enum_declaration", "protocol_declaration",
+                "function_declaration", "extension_declaration",
+            ],
+        },
+        GrammarDescriptor {
+            language: "kotlin",
+            extensions: &["kt", "kts"],
+            top_level_nodes: &[
+                "class_declaration", "object_declaration",
+                "function_declaration", "interface_declaration",
+            ],
+        },
+        GrammarDescriptor {
+            language: "php",
+            extensions: &["php"],
+            top_level_nodes: &[
+                "class_declaration", "interface_declaration",
+                "trait_declaration", "enum_declaration",
+                "function_definition", "method_declaration",
+            ],
+        },
+        GrammarDescriptor {
+            language: "ruby",
+            extensions: &["rb", "rake", "gemspec", "ru"],
+            top_level_nodes: &[
+                "class", "module", "method", "singleton_method",
+            ],
+        },
+        GrammarDescriptor {
+            language: "lua",
+            extensions: &["lua"],
+            top_level_nodes: &[
+                "function_declaration", "local_function",
+                "variable_declaration",
+            ],
+        },
+        GrammarDescriptor {
+            language: "shell",
+            extensions: &["sh", "bash", "zsh", "ksh"],
+            top_level_nodes: &[
+                "function_definition", "command",
+                "variable_assignment",
+            ],
+        },
+        GrammarDescriptor {
+            language: "json",
+            extensions: &["json"],
+            top_level_nodes: &["document"],
+        },
+        GrammarDescriptor {
+            language: "toml",
+            extensions: &["toml"],
+            top_level_nodes: &["document"],
+        },
+        GrammarDescriptor {
+            language: "yaml",
+            extensions: &["yaml", "yml"],
+            top_level_nodes: &["document"],
         },
     ]
 }

@@ -3,9 +3,42 @@
 use std::collections::HashMap;
 
 /// Known file extensions mapped to languages.
+/// Covers all OpenCode-supported LSPs plus common file types.
 const LANGUAGE_EXTENSIONS: &[(&str, &str)] = &[
     // Rust
     ("rs", "rust"),
+    // C/C++
+    ("c", "c"),
+    ("h", "c"),
+    ("cc", "c++"),
+    ("cpp", "c++"),
+    ("cxx", "c++"),
+    ("c++", "c++"),
+    ("hpp", "c++"),
+    ("hh", "c++"),
+    ("hxx", "c++"),
+    ("h++", "c++"),
+    // Go
+    ("go", "go"),
+    // Java
+    ("java", "java"),
+    // Kotlin
+    ("kt", "kotlin"),
+    ("kts", "kotlin"),
+    // Scala
+    ("scala", "scala"),
+    ("sc", "scala"),
+    // C#
+    ("cs", "csharp"),
+    // F#
+    ("fs", "fsharp"),
+    ("fsi", "fsharp"),
+    ("fsx", "fsharp"),
+    ("fsscript", "fsharp"),
+    // Swift
+    ("swift", "swift"),
+    ("objc", "objc"),
+    ("objcpp", "objc"),
     // TypeScript/JavaScript
     ("ts", "typescript"),
     ("tsx", "typescript"),
@@ -13,38 +46,44 @@ const LANGUAGE_EXTENSIONS: &[(&str, &str)] = &[
     ("jsx", "javascript"),
     ("mjs", "javascript"),
     ("cjs", "javascript"),
+    ("mts", "typescript"),
+    ("cts", "typescript"),
     // Python
     ("py", "python"),
     ("pyi", "python"),
-    // Go
-    ("go", "go"),
-    // Java
-    ("java", "java"),
-    // C/C++
-    ("c", "c"),
-    ("cc", "c++"),
-    ("cpp", "c++"),
-    ("cxx", "c++"),
-    ("h", "c"),
-    ("hpp", "c++"),
-    // C#
-    ("cs", "csharp"),
+    ("pyx", "python"),
     // Ruby
     ("rb", "ruby"),
+    ("rake", "ruby"),
+    ("gemspec", "ruby"),
+    ("ru", "ruby"),
     // PHP
     ("php", "php"),
-    // Swift
-    ("swift", "swift"),
-    // Kotlin
-    ("kt", "kotlin"),
-    ("kts", "kotlin"),
-    // Scala
-    ("scala", "scala"),
-    ("sc", "scala"),
+    // Lua
+    ("lua", "lua"),
+    // Dart
+    ("dart", "dart"),
+    // Elixir
+    ("ex", "elixir"),
+    ("exs", "elixir"),
+    // Clojure
+    ("clj", "clojure"),
+    ("cljs", "clojure"),
+    ("cljc", "clojure"),
+    ("edn", "clojure"),
+    // Haskell
+    ("hs", "haskell"),
+    ("lhs", "haskell"),
+    // OCaml
+    ("ml", "ocaml"),
+    ("mli", "ocaml"),
+    // Gleam
+    ("gleam", "gleam"),
     // Shell
     ("sh", "shell"),
     ("bash", "shell"),
     ("zsh", "shell"),
+    ("ksh", "shell"),
     // SQL
     ("sql", "sql"),
     // HTML
@@ -59,11 +98,14 @@ const LANGUAGE_EXTENSIONS: &[(&str, &str)] = &[
     ("vue", "vue"),
     // Svelte
     ("svelte", "svelte"),
+    // Astro
+    ("astro", "astro"),
     // YAML
     ("yaml", "yaml"),
     ("yml", "yaml"),
     // JSON
     ("json", "json"),
+    ("jsonc", "json"),
     // TOML
     ("toml", "toml"),
     // Markdown
@@ -73,6 +115,22 @@ const LANGUAGE_EXTENSIONS: &[(&str, &str)] = &[
     ("xml", "xml"),
     // Docker
     ("dockerfile", "dockerfile"),
+    // Infrastructure
+    ("tf", "terraform"),
+    ("tfvars", "terraform"),
+    ("nix", "nix"),
+    // Proto
+    ("proto", "protobuf"),
+    // Prisma
+    ("prisma", "prisma"),
+    // Typst
+    ("typ", "typst"),
+    ("typc", "typst"),
+    // Zig
+    ("zig", "zig"),
+    ("zon", "zig"),
+    // Julia
+    ("jl", "julia"),
 ];
 
 lazy_static::lazy_static! {
