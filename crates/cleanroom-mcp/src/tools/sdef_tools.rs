@@ -1,4 +1,26 @@
-//! S.DEF query MCP tool parameters.
+//! S.DEF query MCP tool parameters and result types.
+//!
+//! Defines parameters for querying Software Definition entities from the
+//! Cleanroom Agent database. These are read-only tools that retrieve
+//! structured data about data models, contracts, functions, and UI screens.
+//!
+//! # Tools
+//!
+//! - [`GetDataModelParams`] — Retrieve a data model with its attributes
+//! - [`GetContractParams`] — Retrieve an interface/class contract
+//! - [`GetFunctionSpecParams`] — Retrieve a function specification
+//! - [`GetUiScreenParams`] — Retrieve a UI screen definition
+//! - [`ListDocumentsParams`] — List all S.DEF documents
+//! - [`SearchSdefParams`] — Full-text search across S.DEF entities
+//! - [`ListShardsParams`] — List document shards
+//!
+//! # Result Types
+//!
+//! - [`DataModelResult`] — Data model with attributes
+//! - [`ContractResult`] — Contract with type and status
+//! - [`FunctionSpecResult`] — Function with logic and complexity
+//! - [`DocumentResult`] — Document metadata
+//! - [`ShardResult`] — Shard with content hash
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};

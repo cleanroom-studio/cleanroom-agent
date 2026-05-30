@@ -1,7 +1,46 @@
-//! LSP integration MCP tool parameters.
+//! LSP integration MCP tool parameters and result types.
 //!
-//! These tools expose LSP analysis capabilities to the LLM agent
-//! via the MCP interface.
+//! These tools expose Language Server Protocol (LSP) analysis capabilities to the
+//! LLM agent via the MCP interface. The LSP provides rich code understanding
+//! including symbol navigation, type info, references, and diagnostics.
+//!
+//! # LSP Server Pool
+//!
+//! The MCP server maintains a pool of LSP servers (one per language) via
+//! [`LspServerPool`]. Servers are initialized lazily on first use and
+//! reused for subsequent requests.
+//!
+//! # Supported Languages
+//!
+//! - TypeScript/JavaScript (via `typescript-language-server`)
+//! - Rust (via `rust-analyzer`)
+//! - Python (via `pylsp`)
+//! - Go (via `gopls`)
+//! - And other LSP-compatible servers
+//!
+//! # Tools
+//!
+//! | Tool | Description |
+//! |------|-------------|
+//! | [`LspInitParams`] | Initialize LSP server for a language |
+//! | [`LspDocumentSymbolsParams`] | Get all symbols in a document |
+//! | [`LspTypeInfoParams`] | Get type info at cursor position |
+//! | [`LspFindReferencesParams`] | Find all references to a symbol |
+//! | [`LspDiagnosticsParams`] | Get errors/warnings for a file |
+//! | [`LspHierarchyParams`] | Get type hierarchy (supertypes/subtypes) |
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! // Initialize LSP for TypeScript
+//! let init = call("lsp_initialize", json!({ "language": "typescript" }));
+//!
+//! // Get symbols in a file
+//! let symbols = call("lsp_get_document_symbols", json!({
+//!     "file_path": "/project/src/user.ts",
+//!     "language": "typescript"
+//! }));
+//! ```
 
 use rmcp::schemars;
 use serde::Deserialize;

@@ -1,4 +1,36 @@
-//! Consistency check MCP tool parameters.
+//! Consistency check MCP tool parameters and result types.
+//!
+//! These tools manage fingerprint-based consistency verification between
+//! S.DEF documents, the database, and generated code. They enable
+//! detection and repair of drift between layers.
+//!
+//! # Three-Way Consistency Model
+//!
+//! Each tracked entity maintains three hashes:
+//!
+//! - **sdef_hash** — Hash of the S.DEF document definition
+//! - **db_hash** — Hash of the database record
+//! - **code_hash** — Hash of the generated code
+//!
+//! An entity is **consistent** when all three hashes match.
+//! An entity is **inconsistent** when any hash differs.
+//!
+//! # Fix Strategies
+//!
+//! | Strategy | Description |
+//! |----------|-------------|
+//! | `sync_code_to_sdef` | Update code to match S.DEF |
+//! | `regenerate_code` | Regenerate code from scratch |
+//! | `sync_db_to_sdef` | Update DB to match S.DEF |
+//! | `sync_sdef_to_db` | Update S.DEF to match DB |
+//! | `accept_external` | Mark external modification as intentional |
+//!
+//! # Tools
+//!
+//! - [`ConsistencyCheckParams`] — Run consistency check, return inconsistent entities
+//! - [`FingerprintParams`] — Compute/refresh fingerprints for a document
+//! - [`ResolveInconsistencyParams`] — Apply a fix strategy to resolve drift
+//! - [`InconsistencyReportParams`] — Get detailed report with suggested strategies
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};

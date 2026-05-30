@@ -1,4 +1,29 @@
-//! Task management MCP tool parameters and handlers.
+//! Task management MCP tool parameters and result types.
+//!
+//! These parameters are used by the MCP server to deserialize task management
+//! tool calls from the LLM. Each struct corresponds to a specific tool and
+//! is annotated with [`schemars::JsonSchema`] for JSON Schema generation.
+//!
+//! # Tools
+//!
+//! - [`CreateTaskParams`] — Create a new task
+//! - [`ClaimTaskParams`] — Agent claims a pending task
+//! - [`UpdateProgressParams`] — Update task progress
+//! - [`CompleteTaskParams`] — Mark task as completed with output
+//! - [`FailTaskParams`] — Mark task as failed with error message
+//! - [`HeartbeatParams`] — Send heartbeat to indicate task is alive
+//! - [`ListTasksParams`] — List tasks with optional filters
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! let params = CreateTaskParams {
+//!     task_type: "REPO_ANALYZE".to_string(),
+//!     input: json!({ "path": "/tmp/repo" }),
+//!     priority: 10,
+//!     dependencies: vec![],
+//! };
+//! ```
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};

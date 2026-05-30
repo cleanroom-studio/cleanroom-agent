@@ -1,8 +1,36 @@
-//! Progress bar and output formatting utilities for CLI.
+//! Progress tracking utilities for the Cleanroom Agent CLI.
+//!
+//! Provides progress bars, spinners, and output formatting helpers to give
+//! users visual feedback during long-running operations like code analysis
+//! and generation.
+//!
+//! # Components
+//!
+//! - [`ProgressBar`] — Determinate progress with percentage and ETA
+//! - [`ProgressSpinner`] — Indeterminate spinner for unknown-duration tasks
+//! - [`MultiProgress`] — Manager for parallel progress tracking
+//! - Formatting helpers — Key-value pairs, sections, and bullet lists
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use cleanroom_cli::progress::{create_progress_bar, create_spinner, format_kv};
+//!
+//! let pb = create_progress_bar(100, "Processing files...");
+//! for i in 0..100 {
+//!     pb.set_position(i);
+//!     std::thread::sleep(std::time::Duration::from_millis(20));
+//! }
+//! pb.finish_with_message("Done");
+//!
+//! let spinner = create_spinner("Analyzing...");
+//! // ... do work ...
+//! spinner.finish_with_message("Complete");
+//! ```
 
 #![allow(dead_code)]
 
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::time::Duration;
 
 /// Create a styled progress bar for tracking pipeline progress.

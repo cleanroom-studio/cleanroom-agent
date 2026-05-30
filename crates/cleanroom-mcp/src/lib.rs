@@ -1,7 +1,49 @@
-//! cleanroom-mcp — MCP server for Cleanroom Agent.
+//! Cleanroom MCP Server — Model Context Protocol server for Cleanroom Agent.
 //!
-//! Exposes database operations as MCP tools for LLM interaction.
-//! All tools follow the pattern: list_tools → call_tool dispatch.
+//! This crate exposes Cleanroom Agent's database operations as MCP tools, enabling
+//! LLMs to interact with the agent's knowledge base. The server implements the
+//! MCP specification and communicates over stdio transport.
+//!
+//! # Architecture
+//!
+//! - [`CleanroomMcpServer`] — Main server struct implementing [`ServerHandler`]
+//! - Tool dispatcher — Routes tool calls to handler methods
+//! - Middleware — Permission checks and request logging
+//!
+//! # Tool Categories
+//!
+//! | Category | Tools | Description |
+//! |----------|-------|-------------|
+//! | Task Management | `create_task`, `claim_task`, `complete_task`, `fail_task`, `list_tasks` | Workflow task lifecycle |
+//! | S.DEF Query | `get_data_model`, `get_contract`, `get_function_spec`, `list_documents`, `search_sdef` | Read S.DEF entities |
+//! | Naming Service | `resolve_name`, `batch_resolve_names`, `register_custom_name` | Symbol name resolution |
+//! | Import/Export | `export_sdef`, `import_sdef`, `export_shard`, `import_shard` | S.DEF serialization |
+//! | Checkpoint | `create_checkpoint`, `list_checkpoints`, `restore_checkpoint` | Workflow snapshots |
+//! | Consistency | `check_consistency`, `compute_fingerprints`, `resolve_inconsistency` | Fingerprint verification |
+//! | LSP | `lsp_initialize`, `lsp_get_document_symbols`, `lsp_get_type_info` | Code analysis |
+//! | Compatibility | `set_compatibility_mode`, `list_compat_layers`, `ignore_compat_layer` | Compatibility layers |
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use cleanroom_mcp::CleanroomMcpServer;
+//! use std::path::Path;
+//!
+//! let server = CleanroomMcpServer::new(Path::new("state.db")).unwrap();
+//! // Run with tokio: server.serve().await;
+//! ```
+//!
+//! # Protocol
+//!
+//! The server follows the MCP specification:
+//! 1. Client sends `initialize` → Server responds with [`ServerInfo`]
+//! 2. Client calls `tools/list` → Server returns tool definitions
+//! 3. Client calls `tools/call` → Server dispatches to handler, returns [`CallToolResult`]
+//!
+//! # Middleware
+//!
+//! - **Permission checks** — Task mutation tools verify `agent_id` matches `assigned_to`
+//! - **Request logging** — All tool calls are traced with arguments and result summary
 
 use std::path::Path;
 use std::sync::Arc;
@@ -35,6 +77,21 @@ fn tr(key: &str) -> String {
 pub mod tools;
 
 /// The Cleanroom MCP server.
+///
+/// Manages database connections, LSP server pool, and dispatches tool calls.
+/// Implements the MCP [`ServerHandler`] trait for protocol compliance.
+///
+/// # Fields
+///
+/// - `db` — Shared database connection (Arc-wrapped for thread safety)
+/// - `db_path` — Path to SQLite file (for opening additional connections)
+/// - `lsp_pool` — Pool of LSP language servers for code analysis
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let server = CleanroomMcpServer::new(Path::new("state.db")).unwrap();
+/// ```
 #[derive(Debug, Clone)]
 pub struct CleanroomMcpServer {
     /// Database connection.
@@ -46,7 +103,13 @@ pub struct CleanroomMcpServer {
 }
 
 impl CleanroomMcpServer {
-    /// Create a new MCP server instance.
+    /// Creates a new MCP server instance with a database at the given path.
+    ///
+    /// Opens the SQLite database and initializes the LSP server pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened.
     pub fn new(db_path: &Path) -> Result<Self, ErrorData> {
         let db = Database::open(db_path)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -57,7 +120,10 @@ impl CleanroomMcpServer {
         })
     }
 
-    /// Create from an existing Database (useful for testing with in-memory DB).
+    /// Creates a server from an existing shared database.
+    ///
+    /// Useful for testing with in-memory databases or sharing a connection
+    /// that was already opened by another component.
     pub fn from_db(db: Arc<Database>, db_path: &Path) -> Self {
         Self {
             db,
@@ -66,8 +132,24 @@ impl CleanroomMcpServer {
         }
     }
 
-    /// Start the server over stdio transport.
-    /// Also spawns a background consistency checker loop.
+    /// Starts the MCP server over stdio transport.
+    ///
+    /// Spawns a background consistency checker loop (runs every 5 minutes)
+    /// and then serves requests over stdin/stdout. This method blocks
+    /// until the server connection closes.
+    ///
+    /// # Protocol
+    ///
+    /// 1. Initialize: Client sends `initialize`, server responds with capabilities
+    /// 2. Tools/list: Client requests tool definitions, server returns them
+    /// 3. Tools/call: Client invokes a tool, server dispatches and responds
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let server = CleanroomMcpServer::new(Path::new("state.db")).unwrap();
+    /// server.serve().await?;
+    /// ```
     pub async fn serve(self) -> Result<(), ErrorData> {
         // Spawn background consistency checker
         let checker_db = self.db.clone();
@@ -88,13 +170,19 @@ impl CleanroomMcpServer {
     }
 
     /// Helper: derive JSON schemas for tool parameters.
+    ///
+    /// Uses `schemars` to generate a JSON Schema from a type's struct definition.
+    /// The schema is used by MCP to describe tool inputs to the LLM.
     fn schema_for<T: rmcp::schemars::JsonSchema>() -> Arc<JsonObject> {
         let schema = rmcp::schemars::schema_for!(T);
         let value = serde_json::to_value(&schema).unwrap_or(json!({}));
         Arc::new(value.as_object().cloned().unwrap_or_default())
     }
 
-    /// Open a new SQLite connection to the same database file (safe with WAL mode).
+    /// Opens a new SQLite connection to the same database file.
+    ///
+    /// Safe for concurrent access with WAL mode enabled. Used when multiple
+    /// connections are needed for parallel operations.
     fn new_conn(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(&self.db_path)
             .expect("Failed to open additional database connection")
@@ -179,7 +267,20 @@ impl CleanroomMcpServer {
 
     // ============ Middleware Layer ============
 
-    /// Permission check: enforce that agents can only manage tasks they own.
+    /// Permission check middleware.
+    ///
+    /// Enforces that agents can only modify tasks assigned to them. This prevents
+    /// agents from accidentally interfering with each other's work.
+    ///
+    /// # Rules
+    ///
+    /// - `claim_task` — Requires `agent_id` in arguments
+    /// - `complete_task`, `fail_task`, `send_heartbeat`, `update_task_progress` —
+    ///   Verify `agent_id` matches the task's `assigned_to` field
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with "Permission denied" if the agent is not the task owner.
     fn check_permission(&self, tool_name: &str, args: &Value) -> Result<(), String> {
         // Task mutation tools require agent_id to match assigned_to
         let mutating_tasks = [
@@ -209,7 +310,13 @@ impl CleanroomMcpServer {
         Ok(())
     }
 
-    /// Request logging: record all tool calls to tracing.
+    /// Request logging middleware.
+    ///
+    /// Records all tool calls to the tracing log with:
+    /// - Tool name
+    /// - Arguments (truncated to first 5 keys for objects)
+    /// - Result summary (key count for objects)
+    /// - Success/failure with error message
     fn log_request(&self, tool_name: &str, args: &Value, result: &Result<Value, String>) {
         match result {
             Ok(val) => {
@@ -241,6 +348,29 @@ impl CleanroomMcpServer {
 
     // ============ Tool Dispatcher ============
 
+    /// Dispatches an MCP tool call to the appropriate handler.
+    ///
+    /// This is the main entry point for all tool operations. It:
+    /// 1. Parses tool name and arguments
+    /// 2. Runs permission check middleware
+    /// 3. Routes to the correct handler method
+    /// 4. Returns JSON result or error
+    ///
+    /// # Tool Categories
+    ///
+    /// - **Task Management**: `create_task`, `claim_task`, `update_task_progress`, `complete_task`, `fail_task`, `send_heartbeat`, `get_task`, `list_tasks`
+    /// - **S.DEF Query**: `get_data_model`, `get_contract`, `get_function_spec`, `get_ui_screen`, `list_documents`, `search_sdef`, `get_dependency_graph`, `list_shards`
+    /// - **Naming**: `resolve_name`, `batch_resolve_names`, `list_symbols`, `register_custom_name`
+    /// - **Import/Export**: `export_sdef`, `export_sdef_to_disk`, `import_sdef`, `export_shard`, `import_shard`
+    /// - **Checkpoint**: `create_checkpoint`, `list_checkpoints`, `restore_checkpoint`
+    /// - **Transaction**: `begin_transaction`, `commit_transaction`, `rollback_transaction`
+    /// - **Consistency**: `check_consistency`, `compute_fingerprints`, `resolve_inconsistency`, `get_inconsistency_report`
+    /// - **LSP**: `lsp_initialize`, `lsp_get_document_symbols`, `lsp_get_type_info`, `lsp_find_references`, `lsp_get_diagnostics`, `lsp_get_hierarchy`
+    /// - **Compatibility**: `set_compatibility_mode`, `list_compat_layers`, `get_compat_layer_detail`, `ignore_compat_layer`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string for unknown tools, permission denials, or handler failures.
     pub fn dispatch_tool_call(&self, request: rmcp::model::CallToolRequestParams) -> Result<Value, String> {
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
@@ -1406,6 +1536,18 @@ impl CleanroomMcpServer {
 
 // ============ Tool Definitions (i18n) ============
 
+/// Creates an MCP [`Tool`] definition with i18n description.
+///
+/// # Arguments
+///
+/// - `name` — Unique tool identifier (e.g., "create_task")
+/// - `desc_key` — i18n translation key (e.g., "mcp.create_task")
+/// - `read_only` — If true, tool does not modify data (used for permissions)
+///
+/// # Schema Generation
+///
+/// Derives JSON Schema from the generic type `T` using `schemars`.
+/// The schema is included in the tool definition for LLM understanding.
 fn make_tool<T: rmcp::schemars::JsonSchema>(
     name: &'static str,
     desc_key: &str,
@@ -1417,6 +1559,11 @@ fn make_tool<T: rmcp::schemars::JsonSchema>(
         .with_annotations(ToolAnnotations::new().read_only(read_only))
 }
 
+/// Returns the definitions for all MCP tools exposed by this server.
+///
+/// Used by both `list_tools` (to advertise available tools) and `get_tool`
+/// (to look up a specific tool by name). Tool descriptions are fetched
+/// from the i18n system using translation keys.
 fn all_tools() -> Vec<Tool> {
     use tools::task_tools::*;
     use tools::sdef_tools::*;
@@ -1494,13 +1641,28 @@ fn all_tools() -> Vec<Tool> {
 
 // ============ ServerHandler Implementation ============
 
+/// MCP [`ServerHandler`] implementation for Cleanroom Agent.
+///
+/// This trait implementation handles the MCP protocol lifecycle:
+/// - `get_info` — Returns server metadata and capabilities
+/// - `list_tools` — Returns all available tools with their schemas
+/// - `get_tool` — Looks up a single tool by name
+/// - `call_tool` — Dispatches tool calls with middleware
 impl ServerHandler for CleanroomMcpServer {
+    /// Returns server metadata and capabilities.
+    ///
+    /// Announces tools capability and returns server implementation info
+    /// including name and version from `CARGO_PKG_VERSION`.
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("cleanroom-agent", env!("CARGO_PKG_VERSION")))
             .with_instructions(tr("mcp.server_instructions"))
     }
 
+    /// Lists all available MCP tools with their parameter schemas.
+    ///
+    /// Called by MCP clients to discover what tools are available.
+    /// Returns all tools from [`all_tools()`].
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -1510,10 +1672,20 @@ impl ServerHandler for CleanroomMcpServer {
         async move { Ok(ListToolsResult::with_all_items(tools)) }
     }
 
+    /// Looks up a single tool definition by name.
+    ///
+    /// Used by the MCP protocol to validate tool calls before dispatching.
     fn get_tool(&self, name: &str) -> Option<Tool> {
         all_tools().into_iter().find(|t| t.name == name)
     }
 
+    /// Calls an MCP tool and returns the result.
+    ///
+    /// This is the main execution path. It:
+    /// 1. Dispatches to the appropriate handler via [`dispatch_tool_call()`]
+    /// 2. Runs request logging middleware
+    /// 3. Wraps the result in [`Content::json`] or [`Content::text`]
+    /// 4. Sets `is_error` flag if the handler returned an error
     fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,

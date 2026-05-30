@@ -1,6 +1,47 @@
-//! CLI commands — all user-facing messages use i18n via `tr_global!()`.
+//! CLI Commands — All user-facing operations for the Cleanroom Agent.
 //!
-//! Uses `CleanroomAgent` (with adk-rust integration) as the top-level entry point.
+//! This module implements the command dispatcher and individual command handlers.
+//! All user-facing output uses i18n via [`tr_global!()`] for internationalization.
+//!
+//! # Architecture
+//!
+//! - [`Commands`] — Clap enum defining all available subcommands
+//! - [`run()`] — Top-level dispatcher that routes to command handlers
+//! - Individual handler functions — One per command (e.g., [`produce_command()`])
+//!
+//! # Command Categories
+//!
+//! ## Pipeline Commands
+//! - [`Commands::Produce`] — Analyze repository → output S.DEF
+//! - [`Commands::Consume`] — Read S.DEF → generate code
+//!
+//! ## Server Commands
+//! - [`Commands::Serve`] — Start MCP server for external integrations
+//!
+//! ## Workflow Commands
+//! - [`Commands::Resume`] — Resume workflow from checkpoint
+//!
+//! ## Database Commands
+//! - [`Commands::Inspect`] — Inspect database state and consistency
+//! - [`Commands::Export`] — Export S.DEF document to JSON/YAML
+//! - [`Commands::Import`] — Import S.DEF document from JSON/YAML
+//! - [`Commands::Migrate`] — Run database migrations
+//!
+//! ## Analysis Commands
+//! - [`Commands::Upgrade`] — Analyze version differences and breaking changes
+//!
+//! # Internationalization
+//!
+//! All output strings are wrapped with [`tr_global!()`] macro to support
+//! multiple languages. Translation keys follow the pattern `cli.<command>_<action>`.
+//!
+//! # Example
+//!
+//! ```bash
+//! cleanroom produce --repo ./my-project --output ./sdef
+//! cleanroom consume --sdef ./sdef/sdef.json --output ./gen --language typescript
+//! cleanroom inspect --check-type coverage
+//! ```
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,6 +55,27 @@ use cleanroom_agent::{
 use cleanroom_db::Database;
 use cleanroom_i18n::tr_global;
 
+/// Pipeline command: analyze code repository and produce S.DEF output.
+///
+/// # Process
+///
+/// 1. Scans the repository for source files
+/// 2. Runs LLM-powered analysis via ADK
+/// 3. Extracts data models, functions, contracts, and architecture
+/// 4. Writes S.DEF JSON to the output directory
+///
+/// # Output Structure
+///
+/// ```
+/// output/
+/// └── sdef.json          # Complete S.DEF document
+/// ```
+///
+/// # Example
+///
+/// ```bash
+/// cleanroom produce --repo ./my-project --output ./sdef-output --name my-project
+/// ```
 #[derive(Subcommand)]
 pub enum Commands {
     /// Production mode: analyze code repository → output S.DEF
@@ -34,7 +96,33 @@ pub enum Commands {
         api_key: Option<String>,
     },
 
-    /// Consumption mode: read S.DEF → generate code
+    /// Consumption mode: read S.DEF and generate code in target language.
+    ///
+    /// # Process
+    ///
+    /// 1. Loads S.DEF document from JSON/YAML
+    /// 2. Applies compatibility filtering based on `compat_mode`
+    /// 3. Triggers code generation via LLM for specified language/framework
+    /// 4. Validates completeness of generated output
+    ///
+    /// # Compatibility Modes
+    ///
+    /// - `full` — Include all legacy elements, 100% backward compatibility
+    /// - `mixed` — Include compat layers but mark deprecated (default)
+    /// - `clean` — Current version only, strip all legacy code
+    ///
+    /// # Fidelity Levels
+    ///
+    /// - `high` — Maximum detail, all optional fields populated
+    /// - `medium` — Balanced detail (default)
+    /// - `low` — Minimal representation, essential fields only
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cleanroom consume --sdef ./sdef/sdef.json --output ./generated \
+    ///   --language typescript --framework react --compat-mode mixed
+    /// ```
     Consume {
         #[arg(long)]
         sdef: String,
@@ -56,13 +144,41 @@ pub enum Commands {
         api_key: Option<String>,
     },
 
-    /// MCP server mode
+    /// Start MCP server for external tool integrations.
+    ///
+    /// The Model Context Protocol (MCP) server allows external tools like
+    /// editors, IDEs, and other agents to interact with the Cleanroom Agent.
+    ///
+    /// # Transport Types
+    ///
+    /// - `stdio` — Standard input/output (default, for local integration)
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cleanroom serve --transport stdio
+    /// ```
     Serve {
         #[arg(long, default_value = "stdio")]
         transport: String,
     },
 
-    /// Resume workflow from checkpoint
+    /// Resume a previously interrupted workflow from checkpoint.
+    ///
+    /// This command restarts the agent from the last saved checkpoint,
+    /// allowing recovery from crashes or interrupted operations.
+    ///
+    /// # Arguments
+    ///
+    /// - `document` — Name of the S.DEF document to resume
+    /// - `--retry-failed` — If set, also retry tasks that previously failed
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cleanroom resume --document my-project
+    /// cleanroom resume --document my-project --retry-failed
+    /// ```
     Resume {
         #[arg(long)]
         document: String,
@@ -71,13 +187,45 @@ pub enum Commands {
         retry_failed: bool,
     },
 
-    /// Inspect database/S.DEF state
+    /// Inspect database state: consistency, coverage, or task progress.
+    ///
+    /// Provides diagnostic information about the database and S.DEF state.
+    ///
+    /// # Check Types
+    ///
+    /// - `consistency` — Check fingerprint mismatches between S.DEF, DB, and code hashes (default)
+    /// - `coverage` — Report counts of data models, attributes, contracts, functions, symbols
+    /// - `progress` — Show task status breakdown (pending, running, completed, failed)
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cleanroom inspect --check-type consistency
+    /// cleanroom inspect --check-type coverage
+    /// cleanroom inspect --check-type progress
+    /// ```
     Inspect {
         #[arg(long, default_value = "consistency")]
         check_type: String,
     },
 
-    /// Export document
+    /// Export S.DEF document to JSON or YAML file.
+    ///
+    /// Reads a document from the database and serializes it to the specified
+    /// format for backup, sharing, or version control.
+    ///
+    /// # Arguments
+    ///
+    /// - `document` — Name of the S.DEF document to export
+    /// - `--output` — Output file path (default: `./sdef-output/sdef.json`)
+    /// - `--format` — Format: `json` (default) or `yaml`/`yml`
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cleanroom export --document my-project --output ./backup.json
+    /// cleanroom export --document my-project --output ./backup.yaml --format yaml
+    /// ```
     Export {
         #[arg(long)]
         document: String,
@@ -87,19 +235,79 @@ pub enum Commands {
         format: String,
     },
 
-    /// Import document
+    /// Import S.DEF document from JSON or YAML file.
+    ///
+    /// Parses a S.DEF file and loads it into the database, making it available
+    /// for code generation and other operations.
+    ///
+    /// # Arguments
+    ///
+    /// - `file` — Path to S.DEF file (JSON or YAML)
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cleanroom import --file ./sdef-input.json
+    /// ```
     Import {
         #[arg(long)]
         file: String,
     },
 
-    /// Database migration
+    /// Run database migrations.
+    ///
+    /// Applies or rolls back schema migrations for the Cleanroom Agent database.
+    ///
+    /// # Directions
+    ///
+    /// - `up` — Apply pending migrations (default)
+    /// - `down` — Rollback last migration (not supported)
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cleanroom migrate --direction up
+    /// ```
     Migrate {
         #[arg(long, default_value = "up")]
         direction: String,
     },
 
-    /// Version upgrade analysis: detect breaking changes between git tags
+    /// Analyze version differences and breaking changes between git tags.
+    ///
+    /// Compares two git tags or commits and produces a detailed report of:
+    /// - Added, modified, and deleted files
+    /// - Breaking API changes
+    /// - Deprecated entities
+    /// - New compatibility layers
+    /// - Suggested migration paths
+    ///
+    /// # Arguments
+    ///
+    /// - `old_version` — Git ref (tag/commit) for the older version
+    /// - `new_version` — Git ref (tag/commit) for the newer version
+    /// - `repo` — Path to the git repository
+    /// - `--document` — Optional S.DEF document name to scope analysis
+    /// - `--apply` — If true, apply detected changes to the database
+    ///
+    /// # Output
+    ///
+    /// The report includes counts and details for:
+    /// - Files added/modified/deleted
+    /// - Breaking changes (API incompatibilities)
+    /// - Deprecated entities
+    /// - New compatibility layers needed
+    /// - Suggested migrations
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// # Analyze without applying
+    /// cleanroom upgrade --old-version v1.0 --new-version v2.0 --repo ./my-project
+    ///
+    /// # Analyze and apply changes to database
+    /// cleanroom upgrade --old-version v1.0 --new-version v2.0 --repo ./my-project --apply
+    /// ```
     Upgrade {
         #[arg(long)]
         old_version: String,
@@ -115,6 +323,19 @@ pub enum Commands {
     },
 }
 
+/// Dispatches a CLI command to its corresponding handler.
+///
+/// This is the top-level entry point called from `main.rs`. It routes the
+/// parsed [`Commands`] enum to the appropriate function based on variant.
+///
+/// # Arguments
+///
+/// - `command` — The parsed command enum from Clap
+/// - `db_path` — Path to the SQLite database file
+///
+/// # Errors
+///
+/// Returns an error if the underlying handler fails. Error types vary by command.
 pub fn run(command: Commands, db_path: &str) -> Result<()> {
     match command {
         Commands::Produce { repo, output, exclude: _, name, model, api_key } => {
@@ -155,6 +376,9 @@ fn set_api_key(key: Option<String>) {
     }
 }
 
+/// Handler for the `produce` command.
+///
+/// Scans the repository, runs LLM analysis via ADK, and outputs S.DEF JSON.
 fn produce_command(
     repo: &str, output: &str, db_path: &str,
     name: Option<String>, model: Option<String>, api_key: Option<String>,
@@ -190,6 +414,9 @@ fn produce_command(
     })
 }
 
+/// Handler for the `consume` command.
+///
+/// Loads S.DEF, generates code via LLM, and validates output completeness.
 fn consume_command(
     sdef: &str, output: &str, language: &str, framework: Option<&str>,
     compat_mode: &str, fidelity: &str, db_path: &str,
@@ -240,6 +467,9 @@ fn consume_command(
     })
 }
 
+/// Handler for the `serve` command.
+///
+/// Starts the MCP server for external integrations.
 fn serve_command(transport: &str, db_path: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().context(tr_global!("cli.error_runtime"))?;
     rt.block_on(async {
@@ -251,6 +481,9 @@ fn serve_command(transport: &str, db_path: &str) -> Result<()> {
     })
 }
 
+/// Handler for the `resume` command.
+///
+/// Restarts agent from last checkpoint, optionally retrying failed tasks.
 fn resume_command(document: &str, retry_failed: bool, db_path: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().context(tr_global!("cli.error_runtime"))?;
     rt.block_on(async {
@@ -269,6 +502,12 @@ fn resume_command(document: &str, retry_failed: bool, db_path: &str) -> Result<(
     })
 }
 
+/// Handler for the `inspect` command.
+///
+/// Runs database diagnostics based on check type:
+/// - `consistency`: Fingerprint mismatch detection
+/// - `coverage`: Entity counts across all tables
+/// - `progress`: Task status distribution
 fn inspect_command(check_type: &str, db_path: &str) -> Result<()> {
     let db = match Database::open(Path::new(db_path)) {
         Ok(db) => db,
@@ -342,6 +581,9 @@ fn inspect_command(check_type: &str, db_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Handler for the `export` command.
+///
+/// Serializes a S.DEF document from the database to JSON or YAML.
 fn export_command(document: &str, output: &str, format: &str, db_path: &str) -> Result<()> {
     use std::io::Write;
 
@@ -390,6 +632,14 @@ fn export_command(document: &str, output: &str, format: &str, db_path: &str) -> 
     Ok(())
 }
 
+/// Builds a complete [`sdef_core::SoftwareDefinition`] from database contents.
+///
+/// Reconstructs a full S.DEF document by querying the database for:
+/// - Data models and their attributes
+/// - Design decisions
+/// - Architecture layers
+/// - Function specs with input/output parameters
+/// - Interface contracts with methods and invariants
 fn build_export_sdef(
     conn: &rusqlite::Connection,
     name: &str,
@@ -693,6 +943,10 @@ fn build_export_sdef(
     Ok(sdef)
 }
 
+/// Parses and imports a S.DEF file into the database.
+///
+/// Handles both JSON and YAML formats, deserializes the document,
+/// and uses [`SdefImporter`] to load all entities into the database.
 fn import_sdef_file(file: &str, db_path: &str) -> Result<String> {
     let content = std::fs::read_to_string(file)
         .context(tr_global!("cli.import_fail_read"))?;
@@ -717,11 +971,17 @@ fn import_sdef_file(file: &str, db_path: &str) -> Result<String> {
     Ok(sdef.name)
 }
 
+/// Handler for the `import` command.
+///
+/// Wrapper around [`import_sdef_file()`] that discards the returned document name.
 fn import_command(file: &str, db_path: &str) -> Result<()> {
     import_sdef_file(file, db_path)?;
     Ok(())
 }
 
+/// Handler for the `migrate` command.
+///
+/// Runs database migrations. Currently only supports `up` direction.
 fn migrate_command(direction: &str, db_path: &str) -> Result<()> {
     match direction {
         "up" => {
@@ -738,6 +998,10 @@ fn migrate_command(direction: &str, db_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Handler for the `upgrade` command.
+///
+/// Compares two git refs and produces a detailed version upgrade report.
+/// Optionally applies detected changes to the database.
 fn upgrade_command(
     old_version: &str, new_version: &str, repo: &str,
     document: Option<&str>, apply: bool, db_path: &str,

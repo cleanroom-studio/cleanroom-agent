@@ -1,4 +1,29 @@
-//! Import/Export MCP tool parameters.
+//! Import/Export MCP tool parameters and transaction types.
+//!
+//! Handles serialization of S.DEF documents to/from JSON and shard-level
+//! operations. Also provides checkpoint functionality for workflow snapshots
+//! and transaction management for atomic operations.
+//!
+//! # S.DEF Import/Export
+//!
+//! - [`ExportSdefParams`] — Export document to JSON/YAML string
+//! - [`ExportSdefDiskParams`] — Export document to directory structure
+//! - [`ImportSdefParams`] — Import S.DEF from JSON string
+//! - [`ExportShardParams`] — Export a single shard by URI
+//! - [`ImportShardParams`] — Import a shard with content
+//!
+//! # Checkpoint System
+//!
+//! Checkpoints capture a point-in-time snapshot of:
+//! - All tasks (status, input, progress)
+//! - All shards (content hash, file path)
+//!
+//! This enables workflow resumption after crashes.
+//!
+//! # Transaction Management
+//!
+//! Tools like `begin_transaction`, `commit_transaction`, `rollback_transaction`
+//! support atomic operations via a prepared transaction table.
 
 use rmcp::schemars;
 use serde::Deserialize;
