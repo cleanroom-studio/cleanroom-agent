@@ -1,0 +1,46 @@
+[package]
+name = "cleanroom-meta-core"
+version.workspace = true
+# NOTE: autoagents-core 0.3.7 used Rust 2024 let-chains.
+edition = "2024"
+license.workspace = true
+description = "Core agent runtime for the Cleanroom Meta agent framework. Vendored fork of autoagents-core (BasicAgent / AgentBuilder / DirectAgent / ReAct executor / memory / tool / runtime / actor)."
+readme = false
+
+[lib]
+name = "cleanroom_meta_core"
+path = "src/lib.rs"
+
+[features]
+# Optional wasmtime-based tool sandbox. Off by default; turn on for sandboxed tools.
+wasmtime = ["dep:wasmtime"]
+
+[dependencies]
+cleanroom-meta-protocol = { path = "../cleanroom-meta-protocol" }
+cleanroom-meta-llm = { path = "../cleanroom-meta-llm" }
+cleanroom-meta-derive = { path = "../cleanroom-meta-derive" }
+
+async-trait = "0.1"
+futures = "0.3"
+futures-core = "0.3"
+futures-util = "0.3"
+log = { version = "0.4", features = ["std"] }
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+walkdir = "2"
+wasmtime = { version = "43", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ractor = { version = "0.15", features = ["serde", "async-trait"] }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[dev-dependencies]
+# `tempfile` is used by the `environment::tests` module to create a scratch
+# directory for `EnvironmentConfig::working_dir` round-trip tests. The
+# upstream `autoagents-core 0.3.7` had this in its `[dev-dependencies]`
+# too; the vendoring commit dropped it.
+tempfile = "3"

@@ -1,0 +1,18 @@
+[package]
+name = "cleanroom-meta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Facade crate for the Cleanroom Meta agent framework. Re-exports the 4 vendored autoagents-fork crates (cleanroom-meta-{protocol,derive,llm,core}) and `async_trait`. This is the single crate the `#[derive(MetaHooks)]` / `#[meta_agent]` proc macros expect to find at the crate root."
+readme = false
+
+[lib]
+name = "cleanroom_meta"
+path = "src/lib.rs"
+
+[dependencies]
+cleanroom-meta-protocol = { path = "../cleanroom-meta-protocol" }
+cleanroom-meta-derive = { path = "../cleanroom-meta-derive" }
+cleanroom-meta-llm = { path = "../cleanroom-meta-llm" }
+cleanroom-meta-core = { path = "../cleanroom-meta-core" }
+async-trait = "0.1"

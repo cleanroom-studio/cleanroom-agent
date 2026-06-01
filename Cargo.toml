@@ -9,6 +9,17 @@ members = [
     "crates/cleanroom-cli",
     "crates/cleanroom-i18n",
     "crates/cleanroom-prompt",
+    # Phase 1: vendored autoagents fork
+    "crates/cleanroom-meta-protocol",
+    "crates/cleanroom-meta-derive",
+    # Phase 2: vendored autoagents-llm fork (3 backends: openai / anthropic / minimax)
+    "crates/cleanroom-meta-llm",
+    # Phase 3: vendored autoagents-core fork (agent runtime / memory / tool)
+    "crates/cleanroom-meta-core",
+    # Facade crate — the proc-macro entry point. Re-exports the 4 subcrates
+    # plus `async_trait` so `#[derive(MetaHooks)]` / `#[meta_agent]` can write
+    # `::cleanroom_meta::*` paths.
+    "crates/cleanroom-meta",
 ]
 
 [workspace.dependencies]
@@ -25,18 +36,24 @@ rmcp = { version = "1.7", features = ["server", "macros"] }
 rmcp-macros = "1.7"
 schemars = "0.8"
 
-# Agent Framework — autoagents 0.3.7(Phase 0 评估后选定的)
-# - 唯一能跟 MiniMax-M3 (Anthropic 兼容 + OpenAI 兼容)端到端通讯的 Rust framework
-# - rig 的 Anthropic provider 把 URL hardcode 到 api.anthropic.com,且 OpenAI 反序列化
-#   跟 MiniMax 响应不完全兼容(JSON "null vs expected sequence")
-# - autoagents 的 OpenAI provider 接受 base_url override,2.5s 实测端到端通
-# - 配套有 BasicAgent + AgentBuilder 高层 API、ReAct executor、tool calling、structured output
-# features: openai 走 OpenAI 兼容协议,minimax 走其自家 provider(虽然示例用老域名,
-# 但 base_url 可 override),anthropic 备用,logging 看请求细节
-autoagents = { version = "0.3.7", features = ["openai", "minimax", "anthropic", "logging"], default-features = false }
-# `autoagents-derive` provides the `#[agent]` proc macro used by `BasicAgent`
-# integration in `llm_loop::run_loop_via_basic_agent`.
-autoagents-derive = { version = "0.3.7", default-features = false }
+# Agent Framework — VENDORED FORK of autoagents 0.3.7 (now under `cleanroom-meta-*`).
+# We picked autoagents in Phase 0 because it's the only Rust framework that talks
+# to MiniMax-M3 end-to-end (Anthropic-compatible + OpenAI-compatible). Starting
+# Phase 3 we vendored it into the workspace so we can:
+#   1) drop the 8 backends we never use (only openai / anthropic / minimax kept),
+#   2) freely add Responses-API support, custom providers, and memory backends
+#      without upstream merge friction,
+#   3) own the entire agent stack: no `autoagents::` / `autoagents_core::` /
+#      `autoagents_llm::` paths, no `autoagents-derive` proc-macro upstream.
+# All `autoagents::*` symbols now live under `cleanroom_meta::*` with the
+# `Meta*` type prefix (`MetaProvider` ≈ `ChatProvider`, `MetaBuilder` ≈
+# `LLMBuilder`, `MetaBasicAgent` ≈ `BasicAgent`, etc.). See PLAN.md §"Vendor
+# autoagents" for the full rename map.
+cleanroom-meta-protocol = { path = "crates/cleanroom-meta-protocol" }
+cleanroom-meta-llm = { path = "crates/cleanroom-meta-llm" }
+cleanroom-meta-derive = { path = "crates/cleanroom-meta-derive" }
+cleanroom-meta-core = { path = "crates/cleanroom-meta-core" }
+cleanroom-meta = { path = "crates/cleanroom-meta" }
 
 # 之前评估的另外 2 个候选 — 已淘汰,不再作为依赖
 # adk-rust: 0.9.1 ThinkingBlock.signature 字段缺 #[serde(default)],MiniMax 流式响应失败

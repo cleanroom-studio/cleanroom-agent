@@ -1,0 +1,941 @@
+//! OpenAiProvider API client implementation using the OpenAiProvider-compatible base
+//!
+//! This module provides integration with OpenAiProvider's GPT models through their API.
+
+use crate::builder::{MetaBackend, MetaBuilder};
+use crate::chat::Usage;
+use crate::embedding::EmbeddingBuilder;
+use crate::providers::openai_compatible::{
+    OpenAIChatMessage, OpenAIChatResponse, OpenAICompatibleProvider, OpenAIProviderConfig,
+    OpenAIResponseFormat, OpenAIStreamOptions, create_sse_stream,
+};
+use crate::{
+    MetaLlm, ToolCall,
+    chat::{
+        MetaMessage, MetaProvider, MetaResponse, StreamChunk, StreamResponse,
+        MetaStructuredOutputFormat, Tool, MetaToolChoice,
+    },
+    completion::{MetaCompletionProvider, MetaCompletionRequest, MetaCompletionResponse},
+    embedding::MetaEmbeddingProvider,
+    error::MetaError,
+    models::{ModelListRequest, ModelListResponse, MetaModelsProvider, StandardModelListResponse},
+};
+use async_trait::async_trait;
+use futures::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Provider-specific configuration for the OpenAiProvider builder.
+#[derive(Debug, Default, Clone)]
+pub struct OpenAIConfig {
+    pub voice: Option<String>,
+}
+
+/// Internal OpenAiProvider provider config (for OpenAICompatibleProvider)
+struct OpenAIInternalCfg;
+
+impl OpenAIProviderConfig for OpenAIInternalCfg {
+    const PROVIDER_NAME: &'static str = "OpenAiProvider";
+    const DEFAULT_BASE_URL: &'static str = "https://api.openai.com/v1/";
+    const DEFAULT_MODEL: &'static str = "gpt-4.1-nano";
+    const SUPPORTS_REASONING_EFFORT: bool = true;
+    const SUPPORTS_STRUCTURED_OUTPUT: bool = true;
+    const SUPPORTS_PARALLEL_TOOL_CALLS: bool = false;
+    const SUPPORTS_STREAM_OPTIONS: bool = true;
+}
+
+// NOTE: OpenAiProvider cannot directly use the OpenAICompatibleProvider type alias, as it needs specific fields
+
+/// Client for OpenAiProvider API
+pub struct OpenAiProvider {
+    // Delegate to the generic provider for common functionality
+    provider: OpenAICompatibleProvider<OpenAIInternalCfg>,
+    pub enable_web_search: bool,
+    pub web_search_context_size: Option<String>,
+    pub web_search_user_location_type: Option<String>,
+    pub web_search_user_location_approximate_country: Option<String>,
+    pub web_search_user_location_approximate_city: Option<String>,
+    pub web_search_user_location_approximate_region: Option<String>,
+}
+
+/// OpenAiProvider-specific tool that can be either a function tool or a web search tool
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+pub enum OpenAITool {
+    Function {
+        #[serde(rename = "type")]
+        tool_type: String,
+        function: crate::chat::MetaFunctionTool,
+    },
+    WebSearch {
+        #[serde(rename = "type")]
+        tool_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<UserLocation>,
+    },
+}
+
+/// Response for chat with web search
+#[derive(Deserialize, Debug)]
+pub struct OpenAIWebSearchChatResponse {
+    pub output: Vec<OpenAIWebSearchOutput>,
+    pub usage: Option<Usage>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct OpenAIWebSearchOutput {
+    pub content: Option<Vec<OpenAIWebSearchContent>>,
+    pub usage: Option<Usage>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct OpenAIWebSearchContent {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub text: String,
+}
+
+impl std::fmt::Display for OpenAIWebSearchChatResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(text) = self.text() {
+            write!(f, "{text}")
+        } else {
+            write!(f, "No response content")
+        }
+    }
+}
+
+impl MetaResponse for OpenAIWebSearchChatResponse {
+    fn text(&self) -> Option<String> {
+        self.output
+            .last()
+            .and_then(|output| output.content.as_ref())
+            .and_then(|content| content.last())
+            .map(|content| content.text.clone())
+    }
+
+    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        None // Web search responses don't contain tool calls
+    }
+
+    fn thinking(&self) -> Option<String> {
+        None
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        self.usage.clone()
+    }
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+pub struct UserLocation {
+    #[serde(rename = "type")]
+    pub location_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approximate: Option<ApproximateLocation>,
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+pub struct ApproximateLocation {
+    pub country: String,
+    pub city: String,
+    pub region: String,
+}
+
+/// Request payload for OpenAiProvider's chat API endpoint.
+#[derive(Serialize, Debug)]
+pub struct OpenAIAPIChatRequest<'a> {
+    pub model: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<OpenAIChatMessage<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<OpenAITool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<MetaToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<OpenAIResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<OpenAIStreamOptions>,
+    #[serde(flatten)]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
+}
+
+impl OpenAiProvider {
+    /// Creates a new OpenAiProvider client with the specified configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - OpenAiProvider API key
+    /// * `model` - Model to use (defaults to "gpt-3.5-turbo")
+    /// * `max_tokens` - Maximum tokens to generate
+    /// * `temperature` - Sampling temperature
+    /// * `timeout_seconds` - Request timeout in seconds
+    /// * `system` - System prompt
+    /// * `stream` - Whether to stream responses
+    /// * `top_p` - Top-p sampling parameter
+    /// * `top_k` - Top-k sampling parameter
+    /// * `embedding_encoding_format` - Format for embedding outputs
+    /// * `embedding_dimensions` - Dimensions for embedding vectors
+    /// * `tools` - Function tools that the model can use
+    /// * `tool_choice` - Determines how the model uses tools
+    /// * `reasoning_effort` - Reasoning effort level
+    /// * `json_schema` - JSON schema for structured output
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        model: Option<String>,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        timeout_seconds: Option<u64>,
+        top_p: Option<f32>,
+        top_k: Option<u32>,
+        embedding_encoding_format: Option<String>,
+        embedding_dimensions: Option<u32>,
+        tool_choice: Option<MetaToolChoice>,
+        normalize_response: Option<bool>,
+        reasoning_effort: Option<String>,
+        voice: Option<String>,
+        extra_body: Option<serde_json::Value>,
+        enable_web_search: Option<bool>,
+        web_search_context_size: Option<String>,
+        web_search_user_location_type: Option<String>,
+        web_search_user_location_approximate_country: Option<String>,
+        web_search_user_location_approximate_city: Option<String>,
+        web_search_user_location_approximate_region: Option<String>,
+    ) -> Result<Self, MetaError> {
+        let api_key_str = api_key.into();
+        if api_key_str.is_empty() {
+            return Err(MetaError::AuthError("Missing OpenAiProvider API key".to_string()));
+        }
+        Ok(OpenAiProvider {
+            provider: <OpenAICompatibleProvider<OpenAIInternalCfg>>::new(
+                api_key_str,
+                base_url,
+                model,
+                max_tokens,
+                temperature,
+                timeout_seconds,
+                top_p,
+                top_k,
+                tool_choice,
+                reasoning_effort,
+                voice,
+                extra_body,
+                None, // parallel_tool_calls
+                normalize_response,
+                embedding_encoding_format,
+                embedding_dimensions,
+            ),
+            enable_web_search: enable_web_search.unwrap_or(false),
+            web_search_context_size,
+            web_search_user_location_type,
+            web_search_user_location_approximate_country,
+            web_search_user_location_approximate_city,
+            web_search_user_location_approximate_region,
+        })
+    }
+}
+
+// OpenAiProvider-specific implementations that don't fit in the generic provider
+
+#[derive(Serialize)]
+struct OpenAIEmbeddingRequest {
+    model: String,
+    input: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIEmbeddingData {
+    embedding: Vec<f32>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIEmbeddingResponse {
+    data: Vec<OpenAIEmbeddingData>,
+}
+
+// Delegate other provider traits to the internal provider
+#[async_trait]
+impl MetaProvider for OpenAiProvider {
+    /// Chat with tool calls enabled
+    async fn chat_with_tools(
+        &self,
+        messages: &[MetaMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<MetaStructuredOutputFormat>,
+    ) -> Result<Box<dyn MetaResponse>, MetaError> {
+        // Use the common prepare_messages method from the OpenAiProvider-compatible provider
+        let openai_msgs = self.provider.prepare_messages(messages);
+        let response_format: Option<OpenAIResponseFormat> = json_schema.clone().map(|s| s.into());
+        let final_tools = self.build_function_tools(tools);
+        let request_tool_choice = self.resolve_tool_choice_for_request(&final_tools);
+        let body = OpenAIAPIChatRequest {
+            model: self.provider.model.as_str(),
+            messages: openai_msgs,
+            input: None,
+            max_completion_tokens: self.provider.max_tokens,
+            max_output_tokens: None,
+            temperature: self.provider.temperature,
+            stream: false,
+            top_p: self.provider.top_p,
+            top_k: self.provider.top_k,
+            tools: final_tools,
+            tool_choice: request_tool_choice,
+            reasoning_effort: self.provider.reasoning_effort.clone(),
+            response_format,
+            stream_options: None,
+            extra_body: self.provider.extra_body.clone(),
+        };
+        let url = self
+            .provider
+            .base_url
+            .join("chat/completions")
+            .map_err(|e| MetaError::HttpError(e.to_string()))?;
+        let mut request = self
+            .provider
+            .client
+            .post(url)
+            .bearer_auth(&self.provider.api_key)
+            .json(&body);
+        if log::log_enabled!(log::Level::Trace)
+            && let Ok(json) = serde_json::to_string(&body)
+        {
+            log::trace!("OpenAiProvider request payload: {}", json);
+        }
+        if let Some(timeout) = self.provider.timeout_seconds {
+            request = request.timeout(std::time::Duration::from_secs(timeout));
+        }
+        let response = request.send().await?;
+        log::debug!("OpenAiProvider HTTP status: {}", response.status());
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(MetaError::ResponseFormatError {
+                message: format!("OpenAiProvider API returned error status: {status}"),
+                raw_response: error_text,
+            });
+        }
+        // Parse the successful response
+        let resp_text = response.text().await?;
+        let json_resp: Result<OpenAIChatResponse, serde_json::Error> =
+            serde_json::from_str(&resp_text);
+        match json_resp {
+            Ok(response) => Ok(Box::new(response)),
+            Err(e) => Err(MetaError::ResponseFormatError {
+                message: format!("Failed to decode OpenAiProvider API response: {e}"),
+                raw_response: resp_text,
+            }),
+        }
+    }
+
+    async fn chat_with_web_search(&self, input: String) -> Result<Box<dyn MetaResponse>, MetaError> {
+        let web_search_tool = self.build_web_search_tool();
+        self.chat_with_hosted_tools(input, vec![web_search_tool])
+            .await
+    }
+
+    /// Stream chat responses as a stream of strings
+    async fn chat_stream(
+        &self,
+        messages: &[MetaMessage],
+        json_schema: Option<MetaStructuredOutputFormat>,
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<String, MetaError>> + Send>>, MetaError>
+    {
+        let struct_stream = self.chat_stream_struct(messages, None, json_schema).await?;
+        let content_stream = struct_stream.filter_map(|result| async move {
+            match result {
+                Ok(stream_response) => {
+                    if let Some(choice) = stream_response.choices.first()
+                        && let Some(content) = &choice.delta.content
+                        && !content.is_empty()
+                    {
+                        return Some(Ok(content.clone()));
+                    }
+                    None
+                }
+                Err(e) => Some(Err(e)),
+            }
+        });
+        Ok(Box::pin(content_stream))
+    }
+
+    /// Stream chat responses as `MetaMessage` structured objects, including usage information
+    async fn chat_stream_struct(
+        &self,
+        messages: &[MetaMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<MetaStructuredOutputFormat>,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamResponse, MetaError>> + Send>>,
+        MetaError,
+    > {
+        let openai_msgs = self.provider.prepare_messages(messages);
+        let openai_tools = self.build_function_tools(tools);
+        let repsonse_schema: Option<OpenAIResponseFormat> = json_schema.map(|schema| schema.into());
+        let body = OpenAIAPIChatRequest {
+            model: &self.provider.model,
+            messages: openai_msgs,
+            input: None,
+            max_completion_tokens: self.provider.max_tokens,
+            max_output_tokens: None,
+            temperature: self.provider.temperature,
+            stream: true,
+            top_p: self.provider.top_p,
+            top_k: self.provider.top_k,
+            tools: openai_tools,
+            tool_choice: self.provider.tool_choice.clone(),
+            reasoning_effort: self.provider.reasoning_effort.clone(),
+            response_format: repsonse_schema,
+            stream_options: Some(OpenAIStreamOptions {
+                include_usage: true,
+            }),
+            extra_body: self.provider.extra_body.clone(),
+        };
+        let url = self
+            .provider
+            .base_url
+            .join("chat/completions")
+            .map_err(|e| MetaError::HttpError(e.to_string()))?;
+        let mut request = self
+            .provider
+            .client
+            .post(url)
+            .bearer_auth(&self.provider.api_key)
+            .json(&body);
+        if let Some(timeout) = self.provider.timeout_seconds {
+            request = request.timeout(std::time::Duration::from_secs(timeout));
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(MetaError::ResponseFormatError {
+                message: format!("OpenAiProvider API returned error status: {status}"),
+                raw_response: error_text,
+            });
+        }
+        Ok(create_sse_stream(
+            response,
+            self.provider.normalize_response,
+        ))
+    }
+
+    async fn chat_stream_with_tools(
+        &self,
+        messages: &[MetaMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<MetaStructuredOutputFormat>,
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<StreamChunk, MetaError>> + Send>>, MetaError>
+    {
+        // Delegate to the inner OpenAICompatibleProvider which has the full implementation
+        self.provider
+            .chat_stream_with_tools(messages, tools, json_schema)
+            .await
+    }
+}
+
+#[async_trait]
+impl MetaCompletionProvider for OpenAiProvider {
+    async fn complete(
+        &self,
+        _req: &MetaCompletionRequest,
+        _json_schema: Option<MetaStructuredOutputFormat>,
+    ) -> Result<MetaCompletionResponse, MetaError> {
+        Ok(MetaCompletionResponse {
+            text: "OpenAiProvider completion not implemented.".into(),
+        })
+    }
+}
+
+#[async_trait]
+impl MetaModelsProvider for OpenAiProvider {
+    async fn list_models(
+        &self,
+        _request: Option<&ModelListRequest>,
+    ) -> Result<Box<dyn ModelListResponse>, MetaError> {
+        let url = self
+            .base_url()
+            .join("models")
+            .map_err(|e| MetaError::HttpError(e.to_string()))?;
+
+        let resp = self
+            .client()
+            .get(url)
+            .bearer_auth(self.api_key())
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let result = StandardModelListResponse {
+            inner: resp.json().await?,
+            backend: MetaBackend::OpenAI,
+        };
+        Ok(Box::new(result))
+    }
+}
+
+impl MetaLlm for OpenAiProvider {}
+
+impl crate::MetaHasConfig for OpenAiProvider {
+    type Config = OpenAIConfig;
+}
+
+// Helper methods to access provider fields
+impl OpenAiProvider {
+    pub fn api_key(&self) -> &str {
+        &self.provider.api_key
+    }
+
+    pub fn model(&self) -> &str {
+        &self.provider.model
+    }
+
+    pub fn base_url(&self) -> &reqwest::Url {
+        &self.provider.base_url
+    }
+
+    pub fn timeout_seconds(&self) -> Option<u64> {
+        self.provider.timeout_seconds
+    }
+
+    pub fn client(&self) -> &reqwest::Client {
+        &self.provider.client
+    }
+
+    fn build_function_tools(&self, tools: Option<&[Tool]>) -> Option<Vec<OpenAITool>> {
+        let mut openai_tools: Vec<OpenAITool> = Vec::new();
+        if let Some(tools) = tools {
+            for tool in tools {
+                openai_tools.push(OpenAITool::Function {
+                    tool_type: tool.tool_type.clone(),
+                    function: tool.function.clone(),
+                });
+            }
+        }
+        if openai_tools.is_empty() {
+            None
+        } else {
+            Some(openai_tools)
+        }
+    }
+
+    fn resolve_tool_choice_for_request(
+        &self,
+        tools: &Option<Vec<OpenAITool>>,
+    ) -> Option<MetaToolChoice> {
+        if tools.is_some() {
+            self.provider.tool_choice.clone()
+        } else {
+            None
+        }
+    }
+
+    fn build_web_search_tool(&self) -> OpenAITool {
+        let loc_type_opt = self
+            .web_search_user_location_type
+            .as_ref()
+            .filter(|t| matches!(t.as_str(), "exact" | "approximate"));
+        let country = self.web_search_user_location_approximate_country.as_ref();
+        let city = self.web_search_user_location_approximate_city.as_ref();
+        let region = self.web_search_user_location_approximate_region.as_ref();
+        let approximate = if [country, city, region].iter().any(|v| v.is_some()) {
+            Some(ApproximateLocation {
+                country: country.cloned().unwrap_or_default(),
+                city: city.cloned().unwrap_or_default(),
+                region: region.cloned().unwrap_or_default(),
+            })
+        } else {
+            None
+        };
+        let user_location = loc_type_opt.map(|loc_type| UserLocation {
+            location_type: loc_type.clone(),
+            approximate,
+        });
+        OpenAITool::WebSearch {
+            tool_type: "web_search_preview".to_string(),
+            user_location,
+        }
+    }
+
+    /// Chat with OpenAiProvider-hosted tools using the `/responses` endpoint
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - The input message
+    /// * `hosted_tools` - List of OpenAiProvider hosted tools to use
+    ///
+    /// # Returns
+    ///
+    /// The provider's response text or an error
+    pub async fn chat_with_hosted_tools(
+        &self,
+        input: String,
+        hosted_tools: Vec<OpenAITool>,
+    ) -> Result<Box<dyn MetaResponse>, MetaError> {
+        let body = OpenAIAPIChatRequest {
+            model: self.provider.model.as_str(),
+            messages: Vec::new(), // Empty for hosted tools
+            input: Some(input),
+            max_completion_tokens: None,
+            max_output_tokens: self.provider.max_tokens,
+            temperature: self.provider.temperature,
+            stream: false,
+            top_p: self.provider.top_p,
+            top_k: self.provider.top_k,
+            tools: Some(hosted_tools),
+            tool_choice: self.provider.tool_choice.clone(),
+            reasoning_effort: self.provider.reasoning_effort.clone(),
+            response_format: None, // Hosted tools don't use structured output
+            stream_options: None,
+            extra_body: self.provider.extra_body.clone(),
+        };
+
+        let url = self
+            .provider
+            .base_url
+            .join("responses") // Use responses endpoint for hosted tools
+            .map_err(|e| MetaError::HttpError(e.to_string()))?;
+
+        let mut request = self
+            .provider
+            .client
+            .post(url)
+            .bearer_auth(&self.provider.api_key)
+            .json(&body);
+
+        if log::log_enabled!(log::Level::Trace)
+            && let Ok(json) = serde_json::to_string(&body)
+        {
+            log::trace!("OpenAiProvider hosted tools request payload: {}", json);
+        }
+
+        if let Some(timeout) = self.provider.timeout_seconds {
+            request = request.timeout(std::time::Duration::from_secs(timeout));
+        }
+
+        let response = request.send().await?;
+        log::debug!("OpenAiProvider hosted tools HTTP status: {}", response.status());
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(MetaError::ResponseFormatError {
+                message: format!("OpenAiProvider hosted tools API returned error status: {status}"),
+                raw_response: error_text,
+            });
+        }
+        let resp_text = response.text().await?;
+        let json_resp: Result<OpenAIWebSearchChatResponse, serde_json::Error> =
+            serde_json::from_str(&resp_text);
+        match json_resp {
+            Ok(response) => Ok(Box::new(response)),
+            Err(e) => Err(MetaError::ResponseFormatError {
+                message: format!("Failed to decode OpenAiProvider hosted tools API response: {e}"),
+                raw_response: resp_text,
+            }),
+        }
+    }
+}
+
+impl MetaBuilder<OpenAiProvider> {
+    /// Set the voice.
+    pub fn voice(mut self, voice: impl Into<String>) -> Self {
+        self.config.voice = Some(voice.into());
+        self
+    }
+
+    pub fn build(self) -> Result<Arc<OpenAiProvider>, MetaError> {
+        let key = self.api_key.ok_or_else(|| {
+            MetaError::InvalidRequest("No API key provided for OpenAiProvider".to_string())
+        })?;
+        let openai = OpenAiProvider::new(
+            key,
+            self.base_url,
+            self.model,
+            self.max_tokens,
+            self.temperature,
+            self.timeout_seconds,
+            self.top_p,
+            self.top_k,
+            self.embedding_encoding_format,
+            self.embedding_dimensions,
+            self.tool_choice,
+            self.normalize_response,
+            self.reasoning_effort,
+            self.config.voice,
+            self.extra_body,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        Ok(Arc::new(openai))
+    }
+}
+
+#[async_trait]
+impl MetaEmbeddingProvider for OpenAiProvider {
+    async fn embed(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, MetaError> {
+        if self.provider.api_key.is_empty() {
+            return Err(MetaError::AuthError("Missing OpenAiProvider API key".into()));
+        }
+
+        let emb_format = self
+            .provider
+            .embedding_encoding_format
+            .clone()
+            .unwrap_or_else(|| "float".to_string());
+
+        let body = OpenAIEmbeddingRequest {
+            model: self.provider.model.to_string(),
+            input,
+            encoding_format: Some(emb_format),
+            dimensions: self.provider.embedding_dimensions,
+        };
+
+        let url = self
+            .provider
+            .base_url
+            .join("embeddings")
+            .map_err(|e| MetaError::HttpError(e.to_string()))?;
+
+        let resp = self
+            .provider
+            .client
+            .post(url)
+            .bearer_auth(&self.provider.api_key)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let json_resp: OpenAIEmbeddingResponse = resp.json().await?;
+
+        let embeddings = json_resp.data.into_iter().map(|d| d.embedding).collect();
+        Ok(embeddings)
+    }
+}
+
+impl EmbeddingBuilder<OpenAiProvider> {
+    /// Build an OpenAiProvider embedding provider.
+    pub fn build(self) -> Result<Arc<OpenAiProvider>, MetaError> {
+        let api_key = self.api_key.ok_or_else(|| {
+            MetaError::InvalidRequest("No API key provided for OpenAiProvider".to_string())
+        })?;
+
+        let model = self
+            .model
+            .unwrap_or_else(|| "text-embedding-3-small".to_string());
+
+        let provider = OpenAiProvider::new(
+            api_key,
+            self.base_url,
+            Some(model),
+            None,
+            None,
+            self.timeout_seconds,
+            None,
+            None,
+            self.embedding_encoding_format,
+            self.embedding_dimensions,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        Ok(Arc::new(provider))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::MetaBuilder;
+    use crate::chat::{MetaFunctionTool, MetaToolChoice};
+    use either::Either::Right;
+    use serde_json::json;
+
+    #[test]
+    fn test_openai_tool_serialization() {
+        let tool = OpenAITool::Function {
+            tool_type: "function".to_string(),
+            function: MetaFunctionTool {
+                name: "lookup".to_string(),
+                description: "Lookup data".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "q": { "type": "string", "description": "query" }
+                    },
+                    "required": ["q"]
+                }),
+            },
+        };
+        let serialized = serde_json::to_value(&tool).unwrap();
+        assert_eq!(serialized.get("type"), Some(&json!("function")));
+    }
+
+    #[test]
+    fn test_openai_web_search_tool_serialization() {
+        let tool = OpenAITool::WebSearch {
+            tool_type: "web_search".to_string(),
+            user_location: Some(UserLocation {
+                location_type: "approximate".to_string(),
+                approximate: Some(ApproximateLocation {
+                    country: "US".to_string(),
+                    city: "SF".to_string(),
+                    region: "CA".to_string(),
+                }),
+            }),
+        };
+        let serialized = serde_json::to_value(&tool).unwrap();
+        assert_eq!(serialized.get("type"), Some(&json!("web_search")));
+        assert_eq!(
+            serialized
+                .get("user_location")
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("approximate")
+        );
+    }
+
+    #[test]
+    fn test_openai_new_requires_api_key() {
+        let result = OpenAiProvider::new(
+            "", None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None,
+        );
+        assert!(matches!(result, Err(MetaError::AuthError(_))));
+    }
+
+    #[test]
+    fn test_openai_api_chat_request_serialization() {
+        let msg = OpenAIChatMessage {
+            role: "user",
+            content: Some(Right("hello".to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+
+        let request = OpenAIAPIChatRequest {
+            model: "gpt-test",
+            messages: vec![msg],
+            input: None,
+            max_completion_tokens: Some(10),
+            max_output_tokens: None,
+            temperature: Some(0.2),
+            stream: false,
+            top_p: Some(0.9),
+            top_k: Some(40),
+            tools: None,
+            tool_choice: Some(MetaToolChoice::Auto),
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            extra_body: serde_json::Map::new(),
+        };
+
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized.get("model"), Some(&json!("gpt-test")));
+        assert_eq!(
+            serialized
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_openai_builder_requires_api_key() {
+        let result = MetaBuilder::<OpenAiProvider>::new().build();
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert!(err.to_string().contains("No API key provided"));
+        }
+    }
+
+    #[test]
+    fn test_build_function_tools_empty_returns_none() {
+        let provider = OpenAiProvider::new(
+            "key", None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
+        )
+        .unwrap();
+        let tools = provider.build_function_tools(None);
+        assert!(tools.is_none());
+    }
+
+    #[test]
+    fn test_build_web_search_tool_with_location() {
+        let provider = OpenAiProvider::new(
+            "key",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            Some("approximate".to_string()),
+            Some("US".to_string()),
+            Some("SF".to_string()),
+            Some("CA".to_string()),
+        )
+        .unwrap();
+
+        let tool = provider.build_web_search_tool();
+        match tool {
+            OpenAITool::WebSearch { user_location, .. } => {
+                let loc = user_location.expect("location");
+                assert_eq!(loc.location_type, "approximate");
+                let approx = loc.approximate.expect("approx");
+                assert_eq!(approx.country, "US");
+                assert_eq!(approx.city, "SF");
+                assert_eq!(approx.region, "CA");
+            }
+            _ => panic!("expected web search tool"),
+        }
+    }
+}

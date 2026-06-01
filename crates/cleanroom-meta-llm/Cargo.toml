@@ -1,0 +1,48 @@
+[package]
+name = "cleanroom-meta-llm"
+version.workspace = true
+# NOTE: autoagents-llm 0.3.7 used Rust 2024 let-chains (`if let A = x && let B = y`).
+# Bumped to 2024 to match upstream. Protocol & derive crates also on 2024.
+edition = "2024"
+license.workspace = true
+description = "LLM provider abstraction for the Cleanroom Meta agent framework. Vendored fork of autoagents-llm (only OpenAI / Anthropic / MiniMax backends retained)."
+readme = false
+
+[lib]
+name = "cleanroom_meta_llm"
+path = "src/lib.rs"
+
+[features]
+# Optional optimization pipeline (cache, fallback, retry). Off by default to
+# avoid pulling in extra deps; turn on when needed.
+optim = []
+
+[dependencies]
+cleanroom-meta-protocol = { path = "../cleanroom-meta-protocol" }
+
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde", "clock"], default-features = false }
+either = { version = "1", features = ["serde"] }
+futures = "0.3"
+log = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { version = "0.28", features = ["derive", "strum_macros"] }
+thiserror = { workspace = true }
+
+# Non-wasm32 runtime deps
+dirs = "6"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream"] }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+ureq = { version = "3", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+# `tests` in chat/mod.rs use streaming helpers and hyper server fixtures.
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }

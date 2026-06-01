@@ -1,0 +1,126 @@
+use std::marker::PhantomData;
+
+use crate::embedding::MetaEmbeddingProvider;
+
+/// Builder for creating embedding-only providers without going through the LLM builder.
+pub struct EmbeddingBuilder<P: MetaEmbeddingProvider> {
+    backend: PhantomData<P>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) embedding_encoding_format: Option<String>,
+    pub(crate) embedding_dimensions: Option<u32>,
+    pub(crate) api_version: Option<String>,
+    pub(crate) deployment_id: Option<String>,
+    pub(crate) timeout_seconds: Option<u64>,
+}
+
+impl<P: MetaEmbeddingProvider> Default for EmbeddingBuilder<P> {
+    fn default() -> Self {
+        Self {
+            backend: PhantomData,
+            api_key: None,
+            base_url: None,
+            model: None,
+            embedding_encoding_format: None,
+            embedding_dimensions: None,
+            api_version: None,
+            deployment_id: None,
+            timeout_seconds: None,
+        }
+    }
+}
+
+impl<P: MetaEmbeddingProvider> EmbeddingBuilder<P> {
+    /// Create a new embedding provider builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the API key for the provider.
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Set a custom base URL for the provider.
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Set the model identifier for embeddings.
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Set the encoding format for embeddings.
+    pub fn embedding_encoding_format(mut self, format: impl Into<String>) -> Self {
+        self.embedding_encoding_format = Some(format.into());
+        self
+    }
+
+    /// Set the dimensions for embeddings.
+    pub fn embedding_dimensions(mut self, dimensions: u32) -> Self {
+        self.embedding_dimensions = Some(dimensions);
+        self
+    }
+
+    /// Set the API version (used by Azure OpenAiProvider).
+    pub fn api_version(mut self, api_version: impl Into<String>) -> Self {
+        self.api_version = Some(api_version.into());
+        self
+    }
+
+    /// Set the deployment ID (used by Azure OpenAiProvider).
+    pub fn deployment_id(mut self, deployment_id: impl Into<String>) -> Self {
+        self.deployment_id = Some(deployment_id.into());
+        self
+    }
+
+    /// Set a request timeout in seconds.
+    pub fn timeout_seconds(mut self, timeout: u64) -> Self {
+        self.timeout_seconds = Some(timeout);
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyProvider;
+
+    #[async_trait::async_trait]
+    impl MetaEmbeddingProvider for DummyProvider {
+        async fn embed(
+            &self,
+            _input: Vec<String>,
+        ) -> Result<Vec<Vec<f32>>, crate::error::MetaError> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn test_embedding_builder_fields() {
+        let builder = EmbeddingBuilder::<DummyProvider>::new()
+            .api_key("k")
+            .base_url("http://localhost")
+            .model("embed")
+            .embedding_encoding_format("float")
+            .embedding_dimensions(5)
+            .api_version("v1")
+            .deployment_id("dep")
+            .timeout_seconds(10);
+
+        assert_eq!(builder.api_key.as_deref(), Some("k"));
+        assert_eq!(builder.base_url.as_deref(), Some("http://localhost"));
+        assert_eq!(builder.model.as_deref(), Some("embed"));
+        assert_eq!(builder.embedding_encoding_format.as_deref(), Some("float"));
+        assert_eq!(builder.embedding_dimensions, Some(5));
+        assert_eq!(builder.api_version.as_deref(), Some("v1"));
+        assert_eq!(builder.deployment_id.as_deref(), Some("dep"));
+        assert_eq!(builder.timeout_seconds, Some(10));
+    }
+}

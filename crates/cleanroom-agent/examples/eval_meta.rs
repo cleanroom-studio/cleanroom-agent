@@ -1,21 +1,22 @@
-//! `examples/eval_autoagents.rs`
+//! `examples/eval_meta.rs`
 //!
-//! Phase 0 evaluation: real-world smoke test of autoagents 0.3.7 against
-//! MiniMax-M3 (both its Anthropic-compatible and OpenAI-compatible endpoints).
+//! Phase 0 evaluation: real-world smoke test of the vendored `cleanroom-meta-*`
+//! crates (the in-tree fork of autoagents 0.3.7) against MiniMax-M3 (both its
+//! Anthropic-compatible and OpenAI-compatible endpoints).
 //!
-//! autoagents ships both a dedicated `MiniMax` provider and an `Anthropic`
-//! provider; we exercise three paths here:
-//! 1. `MiniMax` provider pointed at the legacy `api.minimax.chat/v1/` host.
-//! 2. `Anthropic` provider with `base_url` overridden to the new
+//! `cleanroom-meta-llm` ships both a dedicated `MinimaxProvider` provider and
+//! an `AnthropicProvider` provider; we exercise three paths here:
+//! 1. `MinimaxProvider` pointed at the legacy `api.minimax.chat/v1/` host.
+//! 2. `AnthropicProvider` with `base_url` overridden to the new
 //!    `api.minimaxi.com/anthropic` host.
-//! 3. `OpenAI` provider with `base_url` overridden to the new
+//! 3. `OpenAiProvider` with `base_url` overridden to the new
 //!    `api.minimaxi.com/v1/` host (OpenAI-compatible path).
 //!
 //! ## Usage
 //!
 //! ```bash
 //! cargo run --manifest-path cleanroom-agent/Cargo.toml \
-//!   -p cleanroom-agent --example eval_autoagents
+//!   -p cleanroom-agent --example eval_meta
 //! ```
 //!
 //! Provider selection is driven by `EVAL_PROVIDER`:
@@ -26,11 +27,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use autoagents::llm::backends::anthropic::Anthropic;
-use autoagents::llm::backends::minimax::MiniMax;
-use autoagents::llm::backends::openai::OpenAI;
-use autoagents::llm::builder::LLMBuilder;
-use autoagents::llm::chat::{ChatMessage, ChatProvider};
+use cleanroom_meta_llm::backends::anthropic::AnthropicProvider;
+use cleanroom_meta_llm::backends::minimax::MinimaxProvider;
+use cleanroom_meta_llm::backends::openai::OpenAiProvider;
+use cleanroom_meta_llm::builder::MetaBuilder;
+use cleanroom_meta_llm::chat::{MetaMessage, MetaProvider};
 
 /// Minimal .env loader: parses `KEY=VALUE` lines, stripping surrounding
 /// double or single quotes from the value. Sets the env var only when the
@@ -78,7 +79,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,autoagents=warn")),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("info,cleanroom_meta=warn")
+                }),
         )
         .init();
 
@@ -95,7 +98,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let prompt = std::env::var("EVAL_PROMPT")
         .unwrap_or_else(|_| "What is 2+2? Answer in one sentence.".to_string());
 
-    println!("== eval_autoagents ==");
+    println!("== eval_meta ==");
     println!("provider: {provider}");
     println!("model:    {model}");
     println!("api_key:  {}", key_preview(&api_key));
@@ -103,7 +106,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let started = std::time::Instant::now();
-    let messages = vec![ChatMessage::user().content(prompt.clone()).build()];
+    let messages = vec![MetaMessage::user().content(prompt.clone()).build()];
 
     match provider.as_str() {
         "anthropic" => {
@@ -111,16 +114,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "https://api.minimaxi.com/anthropic".to_string());
             println!("base_url: {base_url}");
 
-            let llm: Arc<Anthropic> = LLMBuilder::<Anthropic>::new()
+            let llm: Arc<AnthropicProvider> = MetaBuilder::<AnthropicProvider>::new()
                 .api_key(api_key)
                 .base_url(base_url)
                 .model(model.clone())
                 .max_tokens(256)
                 .temperature(0.0)
                 .build()
-                .map_err(|e| format!("Failed to build Anthropic LLM: {e:?}"))?;
+                .map_err(|e| format!("Failed to build AnthropicProvider LLM: {e:?}"))?;
 
-            println!("== calling autoagents::llm (Anthropic provider) ==");
+            println!("== calling cleanroom_meta_llm (AnthropicProvider provider) ==");
             let resp = llm
                 .chat(&messages, None)
                 .await
@@ -135,16 +138,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "https://api.minimax.chat/v1/".to_string());
             println!("base_url: {base_url}");
 
-            let llm: Arc<MiniMax> = LLMBuilder::<MiniMax>::new()
+            let llm: Arc<MinimaxProvider> = MetaBuilder::<MinimaxProvider>::new()
                 .api_key(api_key)
                 .base_url(base_url)
                 .model(model.clone())
                 .max_tokens(256)
                 .temperature(0.0)
                 .build()
-                .map_err(|e| format!("Failed to build MiniMax LLM: {e:?}"))?;
+                .map_err(|e| format!("Failed to build MinimaxProvider LLM: {e:?}"))?;
 
-            println!("== calling autoagents::llm (MiniMax provider) ==");
+            println!("== calling cleanroom_meta_llm (MinimaxProvider provider) ==");
             let resp = llm
                 .chat(&messages, None)
                 .await
@@ -155,24 +158,24 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             println!("response: {resp:?}");
         }
         "openai" => {
-            // The autoagents `OpenAI` provider is just a typed
+            // The `OpenAiProvider` provider is a typed
             // `OpenAICompatibleProvider<OpenAIInternalCfg>` under the hood; we
             // override its hard-coded `https://api.openai.com/v1/` default
-            // via `LLMBuilder::base_url` so it can reach MiniMax instead.
+            // via `MetaBuilder::base_url` so it can reach MiniMax instead.
             let base_url = std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.minimaxi.com/v1/".to_string());
             println!("base_url: {base_url}");
 
-            let llm: Arc<OpenAI> = LLMBuilder::<OpenAI>::new()
+            let llm: Arc<OpenAiProvider> = MetaBuilder::<OpenAiProvider>::new()
                 .api_key(api_key)
                 .base_url(base_url)
                 .model(model.clone())
                 .max_tokens(256)
                 .temperature(0.0)
                 .build()
-                .map_err(|e| format!("Failed to build OpenAI LLM: {e:?}"))?;
+                .map_err(|e| format!("Failed to build OpenAiProvider LLM: {e:?}"))?;
 
-            println!("== calling autoagents::llm (OpenAI provider) ==");
+            println!("== calling cleanroom_meta_llm (OpenAiProvider provider) ==");
             let resp = llm
                 .chat(&messages, None)
                 .await

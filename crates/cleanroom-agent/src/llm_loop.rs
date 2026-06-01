@@ -1,4 +1,4 @@
-//! `llm_loop` — generic LLM agent loop built on top of `autoagents`'s `ChatProvider`.
+//! `llm_loop` — generic LLM agent loop built on top of `autoagents`'s `MetaProvider`.
 //!
 //! # Motivation
 //!
@@ -11,9 +11,9 @@
 //!
 //! # Implementation strategy
 //!
-//! `autoagents`'s [`ChatProvider`] trait exposes a single-shot
+//! `autoagents`'s [`MetaProvider`] trait exposes a single-shot
 //! `chat(messages, schema)` call. Multi-turn ReAct + tool-calling is provided by
-//! autoagents's [`BasicAgent`](autoagents_core::agent::prebuilt::executor::BasicAgent)
+//! autoagents's [`MetaBasicAgent`](autoagents_core::agent::prebuilt::executor::MetaBasicAgent)
 //! and will be adopted in Phase 0.5 once we switch the main Producer/Consumer
 //! path to it.
 //!
@@ -32,11 +32,11 @@
 //! ```ignore
 //! use cleanroom_agent::llm_loop::{run_loop, LoopConfig, LoopContext};
 //! use autoagents::llm::backends::openai::OpenAI;
-//! use autoagents::llm::builder::LLMBuilder;
+//! use autoagents::llm::builder::MetaBuilder;
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let llm: Arc<OpenAI> = LLMBuilder::<OpenAI>::new()
+//! let llm: Arc<OpenAI> = MetaBuilder::<OpenAI>::new()
 //!     .api_key(std::env::var("OPENAI_API_KEY")?)
 //!     .base_url("https://api.minimaxi.com/v1".to_string())
 //!     .model("MiniMax-M3".to_string())
@@ -58,14 +58,14 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use autoagents::core::agent::prebuilt::executor::{BasicAgent, BasicAgentOutput};
-use autoagents::core::agent::task::Task;
-use autoagents::core::agent::{AgentBuilder, AgentOutputT, DirectAgent};
-use autoagents::llm::chat::{
-    ChatMessage, ChatMessageBuilder, ChatProvider, ChatRole,
+use cleanroom_meta_core::agent::prebuilt::executor::{MetaBasicAgent, MetaBasicAgentOutput};
+use cleanroom_meta_core::agent::task::MetaTask;
+use cleanroom_meta_core::agent::{MetaAgentBuilder, MetaOutputT, MetaDirectAgent};
+use cleanroom_meta_llm::chat::{
+    MetaMessage, MetaMessageBuilder, MetaProvider, MetaRole,
 };
-use autoagents::llm::LLMProvider;
-use autoagents_derive::{AgentHooks, AgentOutput, agent};
+use cleanroom_meta_llm::MetaLlm;
+use cleanroom_meta_derive::{MetaHooks, MetaOutput, meta_agent};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
@@ -79,17 +79,17 @@ use tracing::info;
 pub struct LoopConfig {
     /// Maximum number of LLM round-trips. Reserved in the Phase 0.1 single-shot
     /// chat implementation; will be used once Phase 0.5 switches to
-    /// `BasicAgent` / `AgentBuilder`.
+    /// `MetaBasicAgent` / `MetaAgentBuilder`.
     pub max_iterations: u32,
-    /// `max_tokens` for a single LLM call. `autoagents::llm::builder::LLMBuilder`
+    /// `max_tokens` for a single LLM call. `autoagents::llm::builder::MetaBuilder`
     /// already takes it at build time; this field is kept for stats / cost
     /// estimation and to allow post-validation of the response length.
     pub max_tokens_per_call: u32,
     /// Sampling temperature (`0.0` = deterministic, `1.0` = creative).
-    /// `LLMBuilder` consumes it at build time.
+    /// `MetaBuilder` consumes it at build time.
     pub temperature: f32,
     /// Per-tool-call timeout. No-op in Phase 0.1 (single-shot); will take
-    /// effect once Phase 0.5 wires `BasicAgent` / tool-call execution.
+    /// effect once Phase 0.5 wires `MetaBasicAgent` / tool-call execution.
     pub tool_timeout_secs: u64,
     /// Hard cap on total cost in USD. When the estimate exceeds this value,
     /// `run_loop` short-circuits with `LoopOutcome::Aborted`. `None` disables
@@ -114,12 +114,12 @@ impl Default for LoopConfig {
 /// Carries the system prompt, the initial user message, and an internal
 /// stats handle for callers that want to observe in-flight progress.
 pub struct LoopContext {
-    /// Task identifier, used for log correlation.
+    /// MetaTask identifier, used for log correlation.
     pub task_id: String,
     /// Session identifier. Currently used only for logging; Phase 0.5 will
     /// reuse it as the multi-turn conversation history key.
     pub session_id: String,
-    /// Application name, used for logs and `BasicAgent` naming downstream.
+    /// Application name, used for logs and `MetaBasicAgent` naming downstream.
     pub app_name: String,
     /// LLM system prompt. Maps to `role=system` for OpenAI-compatible providers
     /// and the `system` field for Anthropic-compatible providers.
@@ -194,7 +194,7 @@ pub enum LoopOutcome {
 /// the variants for `llm_call_log` and we don't want log fields to drift.
 #[derive(Debug, Error)]
 pub enum LoopError {
-    #[error("no LLM configured (need to construct an autoagents ChatProvider)")]
+    #[error("no LLM configured (need to construct an autoagents MetaProvider)")]
     NoLlm,
     #[error("LLM call failed: {0}")]
     LlmCall(String),
@@ -221,11 +221,11 @@ pub struct LoopStats {
 /// Run one LLM agent loop.
 ///
 /// Phase 0.1 implementation: a single `chat()` call, no multi-turn
-/// tool-calling. Phase 0.5 will switch this to autoagents's `BasicAgent` +
-/// `AgentBuilder` for the full ReAct + tool-call loop, keeping the public
+/// tool-calling. Phase 0.5 will switch this to autoagents's `MetaBasicAgent` +
+/// `MetaAgentBuilder` for the full ReAct + tool-call loop, keeping the public
 /// API stable.
 pub async fn run_loop(
-    llm: Arc<dyn ChatProvider>,
+    llm: Arc<dyn MetaProvider>,
     ctx: LoopContext,
     cfg: &LoopConfig,
 ) -> std::result::Result<LoopOutcome, LoopError> {
@@ -242,10 +242,10 @@ pub async fn run_loop(
 
     // 1. Build the two-message seed: system + user.
     let messages = vec![
-        ChatMessageBuilder::new(ChatRole::System)
+        MetaMessageBuilder::new(MetaRole::System)
             .content(ctx.system_prompt.clone())
             .build(),
-        ChatMessageBuilder::new(ChatRole::User)
+        MetaMessageBuilder::new(MetaRole::User)
             .content(ctx.initial_user_message.clone())
             .build(),
     ];
@@ -315,23 +315,23 @@ pub async fn run_loop(
 }
 
 // ============================================================================
-// autoagents BasicAgent integration
+// autoagents MetaBasicAgent integration
 // ============================================================================
 
 /// Default output payload for [`run_loop_via_basic_agent`].
 ///
-/// Mirrors `autoagents`'s `BasicAgentOutput` so we can convert with
-/// `From<BasicAgentOutput>`. The single `response: String` is what
-/// `BasicAgent` produces for chat-style tasks.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, AgentOutput)]
+/// Mirrors `autoagents`'s `MetaBasicAgentOutput` so we can convert with
+/// `From<MetaBasicAgentOutput>`. The single `response: String` is what
+/// `MetaBasicAgent` produces for chat-style tasks.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, MetaOutput)]
 pub struct LoopAgentOutput {
     /// LLM's text response.
     #[output(description = "The LLM's text response")]
     pub response: String,
 }
 
-impl From<BasicAgentOutput> for LoopAgentOutput {
-    fn from(output: BasicAgentOutput) -> Self {
+impl From<MetaBasicAgentOutput> for LoopAgentOutput {
+    fn from(output: MetaBasicAgentOutput) -> Self {
         LoopAgentOutput {
             response: output.response,
         }
@@ -340,38 +340,38 @@ impl From<BasicAgentOutput> for LoopAgentOutput {
 
 /// A no-op agent struct used by [`run_loop_via_basic_agent`].
 ///
-/// `autoagents`'s `BasicAgent::new` requires a struct annotated with
-/// `#[agent]` and `AgentHooks`. Since `BasicAgent` (and its default
-/// `DirectAgent` executor) only calls the LLM once, the struct body is
+/// `autoagents`'s `MetaBasicAgent::new` requires a struct annotated with
+/// `#[agent]` and `MetaHooks`. Since `MetaBasicAgent` (and its default
+/// `MetaDirectAgent` executor) only calls the LLM once, the struct body is
 /// empty -- all the work happens via the system prompt + user message
-/// passed in at `Task` build time.
+/// passed in at `MetaTask` build time.
 ///
 /// Users who want multi-iter ReAct / tool-calling can supply their own
 /// `#[agent]`-annotated struct instead of using this default.
-#[agent(
+#[meta_agent(
     name = "cleanroom_llm_agent",
     description = "A direct (single-iteration) LLM agent used by cleanroom-agent's llm_loop. \
                    For multi-iter / ReAct / tool-calling, supply a custom agent struct.",
     output = LoopAgentOutput,
 )]
-#[derive(Default, Clone, AgentHooks)]
+#[derive(Default, Clone, MetaHooks)]
 pub struct DefaultLlmAgent {}
 
-/// Run the LLM agent loop via `autoagents`'s `BasicAgent` + `DirectAgent`
+/// Run the LLM agent loop via `autoagents`'s `MetaBasicAgent` + `MetaDirectAgent`
 /// executor.
 ///
 /// This is the autoagents-native counterpart of [`run_loop`]: instead of
 /// calling `llm.chat()` directly, we go through the agent abstraction so
 /// that swapping in a multi-iter / ReAct / tool-calling executor in the
-/// future is a one-line change (replace `DirectAgent` with the new
-/// executor marker in the `AgentBuilder` type parameter).
+/// future is a one-line change (replace `MetaDirectAgent` with the new
+/// executor marker in the `MetaAgentBuilder` type parameter).
 ///
 /// The agent's *output* is a `String` (whatever the LLM produced as text);
-/// the conversation *history* lives entirely inside the agent's `Task`
-/// (single-turn for now, because `DirectAgent` runs exactly one LLM call
+/// the conversation *history* lives entirely inside the agent's `MetaTask`
+/// (single-turn for now, because `MetaDirectAgent` runs exactly one LLM call
 /// per task).
 pub async fn run_loop_via_basic_agent(
-    llm: Arc<dyn LLMProvider>,
+    llm: Arc<dyn MetaLlm>,
     ctx: LoopContext,
     cfg: &LoopConfig,
 ) -> std::result::Result<LoopOutcome, LoopError> {
@@ -382,23 +382,23 @@ pub async fn run_loop_via_basic_agent(
         task_id = %ctx.task_id,
         session_id = %ctx.session_id,
         app_name = %ctx.app_name,
-        "llm_loop::run_loop_via_basic_agent start (DirectAgent, single-iter)"
+        "llm_loop::run_loop_via_basic_agent start (MetaDirectAgent, single-iter)"
     );
 
-    // `BasicAgent` owns the agent struct via the proc-macro-generated
-    // `AgentHooks` impl. Wrap our default no-op struct in it.
-    let basic = BasicAgent::new(DefaultLlmAgent {});
+    // `MetaBasicAgent` owns the agent struct via the proc-macro-generated
+    // `MetaHooks` impl. Wrap our default no-op struct in it.
+    let basic = MetaBasicAgent::new(DefaultLlmAgent {});
 
-    // `AgentBuilder::<_, DirectAgent>` picks the single-iter executor.
+    // `MetaAgentBuilder::<_, MetaDirectAgent>` picks the single-iter executor.
     // Build is async because it sets up the LLM client + memory wiring.
-    let handle = AgentBuilder::<_, DirectAgent>::new(basic)
+    let handle = MetaAgentBuilder::<_, MetaDirectAgent>::new(basic)
         .llm(llm)
         .build()
         .await
-        .map_err(|e| LoopError::LlmCall(format!("BasicAgent build failed: {e}")))?;
+        .map_err(|e| LoopError::LlmCall(format!("MetaBasicAgent build failed: {e}")))?;
 
-    // Encode the system prompt + user message into a single `Task` string.
-    // `DirectAgent` doesn't do multi-turn -- it appends the system role
+    // Encode the system prompt + user message into a single `MetaTask` string.
+    // `MetaDirectAgent` doesn't do multi-turn -- it appends the system role
     // and then sends the user message once. We mirror that by concatenating
     // them in a way the LLM understands.
     let task_prompt = format!(
@@ -406,15 +406,15 @@ pub async fn run_loop_via_basic_agent(
         ctx.system_prompt.trim_end(),
         ctx.initial_user_message
     );
-    let task = Task::new(task_prompt);
+    let task = MetaTask::new(task_prompt);
 
-    // `agent_handle.agent.run(task)` is async; returns a `BasicAgentOutput`
+    // `agent_handle.agent.run(task)` is async; returns a `MetaBasicAgentOutput`
     // (or its serde-encoded value) which we convert into our outcome.
     let output: LoopAgentOutput = handle
         .agent
         .run(task)
         .await
-        .map_err(|e| LoopError::LlmCall(format!("BasicAgent run failed: {e}")))?;
+        .map_err(|e| LoopError::LlmCall(format!("MetaBasicAgent run failed: {e}")))?;
 
     // Stats
     {
@@ -447,7 +447,7 @@ pub async fn run_loop_via_basic_agent(
 
     if output.response.is_empty() {
         return Ok(LoopOutcome::LlmRefused {
-            reason: "empty text in BasicAgent output".to_string(),
+            reason: "empty text in MetaBasicAgent output".to_string(),
             iterations: 1,
         });
     }

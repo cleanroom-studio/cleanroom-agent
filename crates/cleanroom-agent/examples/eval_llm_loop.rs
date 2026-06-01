@@ -2,12 +2,12 @@
 //!
 //! Phase 0.4.5 end-to-end smoke test of `llm_loop::run_loop_via_basic_agent`.
 //!
-//! Unlike `eval_autoagents.rs` (which exercises the raw `autoagents::llm`
-//! `ChatProvider::chat()` call), this example goes through the full
-//! `BasicAgent` + `AgentBuilder` + `DirectAgent` path that `llm_loop` uses
-//! internally. Phase 0.5 will switch Producer/Consumer over to this path,
-//! so this example is the "canonical" shape of how the rest of the project
-//! will eventually call the LLM.
+//! Unlike `eval_meta.rs` (which exercises the raw `cleanroom_meta_llm`
+//! `MetaProvider::chat()` call), this example goes through the full
+//! `MetaBasicAgent` + `MetaAgentBuilder` + `MetaDirectAgent` path that
+//! `llm_loop` uses internally. Phase 0.5 will switch Producer/Consumer over
+//! to this path, so this example is the "canonical" shape of how the rest
+//! of the project will eventually call the LLM.
 //!
 //! ## Usage
 //!
@@ -25,17 +25,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use autoagents::llm::backends::anthropic::Anthropic;
-use autoagents::llm::backends::minimax::MiniMax;
-use autoagents::llm::backends::openai::OpenAI;
-use autoagents::llm::builder::LLMBuilder;
-use autoagents::llm::LLMProvider;
+use cleanroom_meta_llm::backends::anthropic::AnthropicProvider;
+use cleanroom_meta_llm::backends::minimax::MinimaxProvider;
+use cleanroom_meta_llm::backends::openai::OpenAiProvider;
+use cleanroom_meta_llm::builder::MetaBuilder;
+use cleanroom_meta_llm::MetaLlm;
 
 use cleanroom_agent::llm_loop::{
     run_loop_via_basic_agent, LoopConfig, LoopContext, LoopOutcome,
 };
 
-/// Minimal `.env` loader. See `eval_autoagents.rs` for the full rationale;
+/// Minimal `.env` loader. See `eval_meta.rs` for the full rationale;
 /// we duplicate it here rather than dragging the eval example into
 /// `llm_loop`'s public API surface.
 fn load_dotenv(path: &Path) {
@@ -71,22 +71,23 @@ fn key_preview(api_key: &str) -> String {
     }
 }
 
-/// Build the `Arc<dyn LLMProvider>` the user picked via `EVAL_PROVIDER`.
+/// Build the `Arc<dyn MetaLlm>` the user picked via `EVAL_PROVIDER`.
 ///
-/// This is the only place the example knows about `autoagents`'s `OpenAI`
-/// / `Anthropic` / `MiniMax` types -- `llm_loop::run_loop_via_basic_agent`
-/// itself only sees the `LLMProvider` trait.
+/// This is the only place the example knows about `cleanroom_meta_llm`'s
+/// `OpenAiProvider` / `AnthropicProvider` / `MinimaxProvider` types --
+/// `llm_loop::run_loop_via_basic_agent` itself only sees the `MetaLlm`
+/// trait.
 fn build_llm(
     provider: &str,
     api_key: &str,
     model: &str,
-) -> std::result::Result<Arc<dyn LLMProvider>, Box<dyn std::error::Error>> {
+) -> std::result::Result<Arc<dyn MetaLlm>, Box<dyn std::error::Error>> {
     match provider {
         "openai" => {
             if std::env::var_os("OPENAI_BASE_URL").is_none() {
                 std::env::set_var("OPENAI_BASE_URL", "https://api.minimaxi.com/v1");
             }
-            let llm: Arc<OpenAI> = LLMBuilder::<OpenAI>::new()
+            let llm: Arc<OpenAiProvider> = MetaBuilder::<OpenAiProvider>::new()
                 .api_key(api_key.to_string())
                 .base_url(
                     std::env::var("OPENAI_BASE_URL")
@@ -105,7 +106,7 @@ fn build_llm(
                     "https://api.minimaxi.com/anthropic",
                 );
             }
-            let llm: Arc<Anthropic> = LLMBuilder::<Anthropic>::new()
+            let llm: Arc<AnthropicProvider> = MetaBuilder::<AnthropicProvider>::new()
                 .api_key(api_key.to_string())
                 .base_url(
                     std::env::var("ANTHROPIC_BASE_URL")
@@ -118,7 +119,7 @@ fn build_llm(
             Ok(llm)
         }
         "minimax" => {
-            let llm: Arc<MiniMax> = LLMBuilder::<MiniMax>::new()
+            let llm: Arc<MinimaxProvider> = MetaBuilder::<MinimaxProvider>::new()
                 .api_key(api_key.to_string())
                 .base_url(
                     std::env::var("EVAL_BASE_URL")
@@ -139,7 +140,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,autoagents=warn")),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("info,cleanroom_meta=warn")
+                }),
         )
         .init();
 

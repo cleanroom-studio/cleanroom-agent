@@ -1,0 +1,51 @@
+use crate::agent::task::MetaTask;
+use crate::agent::{MetaDeriveT, Context};
+use crate::tool::ToolCallResult;
+use async_trait::async_trait;
+use cleanroom_meta_llm::ToolCall;
+use serde_json::Value;
+
+/// Outcome for hook execution: continue or abort the run.
+#[derive(PartialEq)]
+pub enum MetaHookOutcome {
+    Continue,
+    Abort,
+}
+
+/// Lifecycle hooks that allow observing and customizing agent behavior.
+/// Implementers can observe agent creation, per-run lifecycle (start/complete),
+/// per-turn lifecycle (start/complete) for multi-turn executors, and tool
+/// execution (pre-call gating, start, result, error).
+#[async_trait]
+pub trait MetaHooks: MetaDeriveT + Send + Sync {
+    /// Hook called when builder creates a new instance of MetaBaseAgent
+    async fn on_agent_create(&self) {}
+    /// Called when the Agent Execution is Triggered, Ability to Abort is Given for users
+    async fn on_run_start(&self, _task: &MetaTask, _ctx: &Context) -> MetaHookOutcome {
+        MetaHookOutcome::Continue
+    }
+    /// Called when the Agent Execution is Completed
+    async fn on_run_complete(&self, _task: &MetaTask, _result: &Self::Output, _ctx: &Context) {}
+    /// Called when an executor turn is started, useful for multi-turn Executors like ReAct
+    async fn on_turn_start(&self, _turn_index: usize, _ctx: &Context) {}
+    /// Called when an executor turn is completed, useful for multi-turn Executors like ReAct
+    async fn on_turn_complete(&self, _turn_index: usize, _ctx: &Context) {}
+    //. Run the hook before executing the tool_call giving ability to Abort or Continue
+    async fn on_tool_call(&self, _tool_call: &ToolCall, _ctx: &Context) -> MetaHookOutcome {
+        MetaHookOutcome::Continue
+    }
+    /// Called before executing the tool
+    async fn on_tool_start(&self, _tool_call: &ToolCall, _ctx: &Context) {}
+    /// Called post execution of tool with results
+    async fn on_tool_result(
+        &self,
+        _tool_call: &ToolCall,
+        _result: &ToolCallResult,
+        _ctx: &Context,
+    ) {
+    }
+    /// Called if the execution of the tool failed
+    async fn on_tool_error(&self, _tool_call: &ToolCall, _err: Value, _ctx: &Context) {}
+    /// Called when an Actor Agent post-shutdown, This has no effect on MetaDirectAgent, It only works for ActorBased Agents
+    async fn on_agent_shutdown(&self) {}
+}

@@ -9,10 +9,16 @@ cleanroom-db = { path = "../cleanroom-db" }
 cleanroom-lsp = { path = "../cleanroom-lsp" }
 cleanroom-prompt = { path = "../cleanroom-prompt" }
 sdef-core = { path = "../sdef-core" }
-# LLM agent framework — 唯一选定的 autoagents
-autoagents.workspace = true
-# `#[agent]` proc macro used by `llm_loop::run_loop_via_basic_agent`
-autoagents-derive.workspace = true
+# LLM agent framework — vendored autoagents fork (cleanroom-meta-*). All 5
+# crates are in the workspace; we depend on them by path here. The `cleanroom-meta`
+# facade is required by the `#[derive(MetaHooks)]` / `#[meta_agent]` proc
+# macros, which generate `::cleanroom_meta::async_trait` / `::cleanroom_meta::core::*`
+# paths and need a crate at that name to resolve against.
+cleanroom-meta.workspace = true
+cleanroom-meta-protocol.workspace = true
+cleanroom-meta-llm.workspace = true
+cleanroom-meta-derive.workspace = true
+cleanroom-meta-core.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true
