@@ -69,6 +69,13 @@ pub enum TaskType {
     ValidateDataModel,
     ValidateCrossFile,
     RoundtripVerify,
+    // LLM-driven task types (Phase 0.4). `LlmAnalyzeFile` is the
+    // leaf-level replacement for `RepoAnalyze` once the Producer pipeline
+    // is driven by `llm_loop::run_loop`; `LlmGenerateCode` replaces
+    // `GenerateCode` for the Consumer pipeline. Both have a corresponding
+    // CHECK-constraint entry in `migrations/007_llm_task_types.sql`.
+    LlmAnalyzeFile,
+    LlmGenerateCode,
 }
 
 impl TaskType {
@@ -91,6 +98,8 @@ impl TaskType {
             Self::ValidateDataModel => "VALIDATE_DATA_MODEL",
             Self::ValidateCrossFile => "VALIDATE_CROSS_FILE",
             Self::RoundtripVerify => "ROUNDTRIP_VERIFY",
+            Self::LlmAnalyzeFile => "LLM_ANALYZE_FILE",
+            Self::LlmGenerateCode => "LLM_GENERATE_CODE",
         }
     }
 
@@ -113,6 +122,8 @@ impl TaskType {
             "VALIDATE_DATA_MODEL" => Some(Self::ValidateDataModel),
             "VALIDATE_CROSS_FILE" => Some(Self::ValidateCrossFile),
             "ROUNDTRIP_VERIFY" => Some(Self::RoundtripVerify),
+            "LLM_ANALYZE_FILE" => Some(Self::LlmAnalyzeFile),
+            "LLM_GENERATE_CODE" => Some(Self::LlmGenerateCode),
             _ => None,
         }
     }

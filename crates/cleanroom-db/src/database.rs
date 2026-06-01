@@ -43,6 +43,16 @@ impl Database {
     /// Open or create a database at the given path.
     #[instrument(skip_all, fields(path = %path.display()))]
     pub fn open(path: &Path) -> DbResult<Self> {
+        Self::open_with_migrations_from(path, None)
+    }
+
+    /// Like [`Self::open`], but with an explicit migrations directory.
+    ///
+    /// Pass `Some(dir)` to point at a non-default migrations path (useful for
+    /// tests where the binary's CWD isn't the workspace root). `None` keeps
+    /// the CWD-based default search behavior.
+    #[instrument(skip_all, fields(path = %path.display()))]
+    pub fn open_with_migrations_from(path: &Path, migrations_dir: Option<&Path>) -> DbResult<Self> {
         let flags = OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_FULL_MUTEX;
@@ -54,7 +64,10 @@ impl Database {
             conn: Arc::new(Mutex::new(conn)),
         };
         db.configure()?;
-        db.run_migrations()?;
+        match migrations_dir {
+            Some(dir) => db.run_migrations_at(dir)?,
+            None => db.run_migrations()?,
+        }
         info!("Database opened successfully");
         Ok(db)
     }
@@ -81,6 +94,20 @@ impl Database {
     fn run_migrations(&self) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
         migrations::run_pending(&conn)?;
+        drop(conn);
+        Ok(())
+    }
+
+    /// Run pending migrations from an explicit directory.
+    ///
+    /// `Database::open` is a hot path that runs migrations at CWD-relative
+    /// paths. Tests that don't sit in the workspace root should call this
+    /// method (or the underlying [`migrations::run_pending_at`]) with the
+    /// workspace `migrations/` directory derived from
+    /// `env!("CARGO_MANIFEST_DIR")`.
+    pub fn run_migrations_at(&self, migrations_dir: &Path) -> DbResult<()> {
+        let conn = self.conn.lock().unwrap();
+        migrations::run_pending_at(&conn, migrations_dir)?;
         drop(conn);
         Ok(())
     }

@@ -58,9 +58,14 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
+use autoagents::core::agent::prebuilt::executor::{BasicAgent, BasicAgentOutput};
+use autoagents::core::agent::task::Task;
+use autoagents::core::agent::{AgentBuilder, AgentOutputT, DirectAgent};
 use autoagents::llm::chat::{
     ChatMessage, ChatMessageBuilder, ChatProvider, ChatRole,
 };
+use autoagents::llm::LLMProvider;
+use autoagents_derive::{AgentHooks, AgentOutput, agent};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
@@ -303,6 +308,152 @@ pub async fn run_loop(
 
     Ok(LoopOutcome::Done {
         result: text,
+        iterations: 1,
+        prompt_tokens: snapshot.prompt_tokens,
+        completion_tokens: snapshot.completion_tokens,
+    })
+}
+
+// ============================================================================
+// autoagents BasicAgent integration
+// ============================================================================
+
+/// Default output payload for [`run_loop_via_basic_agent`].
+///
+/// Mirrors `autoagents`'s `BasicAgentOutput` so we can convert with
+/// `From<BasicAgentOutput>`. The single `response: String` is what
+/// `BasicAgent` produces for chat-style tasks.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, AgentOutput)]
+pub struct LoopAgentOutput {
+    /// LLM's text response.
+    #[output(description = "The LLM's text response")]
+    pub response: String,
+}
+
+impl From<BasicAgentOutput> for LoopAgentOutput {
+    fn from(output: BasicAgentOutput) -> Self {
+        LoopAgentOutput {
+            response: output.response,
+        }
+    }
+}
+
+/// A no-op agent struct used by [`run_loop_via_basic_agent`].
+///
+/// `autoagents`'s `BasicAgent::new` requires a struct annotated with
+/// `#[agent]` and `AgentHooks`. Since `BasicAgent` (and its default
+/// `DirectAgent` executor) only calls the LLM once, the struct body is
+/// empty -- all the work happens via the system prompt + user message
+/// passed in at `Task` build time.
+///
+/// Users who want multi-iter ReAct / tool-calling can supply their own
+/// `#[agent]`-annotated struct instead of using this default.
+#[agent(
+    name = "cleanroom_llm_agent",
+    description = "A direct (single-iteration) LLM agent used by cleanroom-agent's llm_loop. \
+                   For multi-iter / ReAct / tool-calling, supply a custom agent struct.",
+    output = LoopAgentOutput,
+)]
+#[derive(Default, Clone, AgentHooks)]
+pub struct DefaultLlmAgent {}
+
+/// Run the LLM agent loop via `autoagents`'s `BasicAgent` + `DirectAgent`
+/// executor.
+///
+/// This is the autoagents-native counterpart of [`run_loop`]: instead of
+/// calling `llm.chat()` directly, we go through the agent abstraction so
+/// that swapping in a multi-iter / ReAct / tool-calling executor in the
+/// future is a one-line change (replace `DirectAgent` with the new
+/// executor marker in the `AgentBuilder` type parameter).
+///
+/// The agent's *output* is a `String` (whatever the LLM produced as text);
+/// the conversation *history* lives entirely inside the agent's `Task`
+/// (single-turn for now, because `DirectAgent` runs exactly one LLM call
+/// per task).
+pub async fn run_loop_via_basic_agent(
+    llm: Arc<dyn LLMProvider>,
+    ctx: LoopContext,
+    cfg: &LoopConfig,
+) -> std::result::Result<LoopOutcome, LoopError> {
+    let started = Instant::now();
+    let stats = ctx.stats_handle();
+
+    info!(
+        task_id = %ctx.task_id,
+        session_id = %ctx.session_id,
+        app_name = %ctx.app_name,
+        "llm_loop::run_loop_via_basic_agent start (DirectAgent, single-iter)"
+    );
+
+    // `BasicAgent` owns the agent struct via the proc-macro-generated
+    // `AgentHooks` impl. Wrap our default no-op struct in it.
+    let basic = BasicAgent::new(DefaultLlmAgent {});
+
+    // `AgentBuilder::<_, DirectAgent>` picks the single-iter executor.
+    // Build is async because it sets up the LLM client + memory wiring.
+    let handle = AgentBuilder::<_, DirectAgent>::new(basic)
+        .llm(llm)
+        .build()
+        .await
+        .map_err(|e| LoopError::LlmCall(format!("BasicAgent build failed: {e}")))?;
+
+    // Encode the system prompt + user message into a single `Task` string.
+    // `DirectAgent` doesn't do multi-turn -- it appends the system role
+    // and then sends the user message once. We mirror that by concatenating
+    // them in a way the LLM understands.
+    let task_prompt = format!(
+        "{}\n\n{}",
+        ctx.system_prompt.trim_end(),
+        ctx.initial_user_message
+    );
+    let task = Task::new(task_prompt);
+
+    // `agent_handle.agent.run(task)` is async; returns a `BasicAgentOutput`
+    // (or its serde-encoded value) which we convert into our outcome.
+    let output: LoopAgentOutput = handle
+        .agent
+        .run(task)
+        .await
+        .map_err(|e| LoopError::LlmCall(format!("BasicAgent run failed: {e}")))?;
+
+    // Stats
+    {
+        let mut s = lock_stats(&stats);
+        s.iterations = 1;
+        s.elapsed_ms = started.elapsed().as_millis() as u64;
+        s.cost_estimate_usd =
+            estimate_cost(s.prompt_tokens, s.completion_tokens);
+    }
+    let snapshot = lock_stats(&stats).clone();
+
+    info!(
+        task_id = %ctx.task_id,
+        elapsed_ms = snapshot.elapsed_ms,
+        "llm_loop::run_loop_via_basic_agent end"
+    );
+
+    // Cost guard
+    if let Some(limit) = cfg.cost_limit_usd {
+        if snapshot.cost_estimate_usd > limit {
+            return Ok(LoopOutcome::Aborted {
+                reason: format!(
+                    "cost limit ${:.4} exceeded (est. ${:.4})",
+                    limit, snapshot.cost_estimate_usd
+                ),
+                iterations: 1,
+            });
+        }
+    }
+
+    if output.response.is_empty() {
+        return Ok(LoopOutcome::LlmRefused {
+            reason: "empty text in BasicAgent output".to_string(),
+            iterations: 1,
+        });
+    }
+
+    Ok(LoopOutcome::Done {
+        result: output.response,
         iterations: 1,
         prompt_tokens: snapshot.prompt_tokens,
         completion_tokens: snapshot.completion_tokens,

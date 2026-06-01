@@ -249,6 +249,101 @@ impl TaskPlan {
             document_name: document_name.to_string(),
         }
     }
+
+    /// Create an LLM-driven file-level analysis plan.
+    ///
+    /// Emits one `LlmAnalyzeFile` task per file path. Files are independent of
+    /// each other (no inter-file dependencies), so they all land in the same
+    /// priority group and can be processed in parallel by N agent workers.
+    /// This is the leaf-level replacement for [`Self::analysis_plan`]'s
+    /// `RepoAnalyze` task once the Producer is driven by `llm_loop::run_loop`.
+    ///
+    /// `file_paths` should be repo-relative (e.g. `"src/main.rs"`). The full
+    /// repo path is sent in `input["repo_path"]` so the worker can resolve
+    /// the file on disk.
+    pub fn llm_analysis_plan(
+        document_name: &str,
+        repo_path: &str,
+        file_paths: &[&str],
+    ) -> Self {
+        let base_input = serde_json::json!({
+            "document": document_name,
+            "project_name": document_name,
+            "repo_path": repo_path,
+        });
+
+        // One task per file, all at priority 8 (high but not critical-path).
+        // `max_retries: 2` keeps the noise low -- failed LLM calls are usually
+        // worth surfacing to a human rather than hammering the API.
+        let tasks: Vec<TaskTemplate> = file_paths
+            .iter()
+            .map(|p| TaskTemplate {
+                task_type: TaskType::LlmAnalyzeFile,
+                priority: 8,
+                input: {
+                    let mut inp = base_input.clone();
+                    inp["file_path"] = serde_json::Value::String((*p).to_string());
+                    inp
+                },
+                dependency_indices: vec![],
+                max_retries: 2,
+            })
+            .collect();
+
+        Self {
+            priority_groups: if tasks.is_empty() {
+                vec![]
+            } else {
+                vec![tasks]
+            },
+            document_name: document_name.to_string(),
+        }
+    }
+
+    /// Create an LLM-driven entity-level code generation plan.
+    ///
+    /// Emits one `LlmGenerateCode` task per entity URI. All tasks live in a
+    /// single priority group with no inter-entity dependencies, mirroring
+    /// `llm_analysis_plan`'s parallel-friendly shape. This is the leaf-level
+    /// replacement for [`Self::generation_plan`]'s `GenerateCode` task once
+    /// the Consumer is driven by `llm_loop::run_loop`.
+    ///
+    /// `entity_uris` should be S.DEF entity URIs (e.g. `"sdef://my-proj/User"`).
+    pub fn llm_generation_plan(
+        document_name: &str,
+        target_language: &str,
+        entity_uris: &[&str],
+    ) -> Self {
+        let base_input = serde_json::json!({
+            "document": document_name,
+            "project_name": document_name,
+            "target_language": target_language,
+        });
+
+        let tasks: Vec<TaskTemplate> = entity_uris
+            .iter()
+            .map(|uri| TaskTemplate {
+                task_type: TaskType::LlmGenerateCode,
+                priority: 8,
+                input: {
+                    let mut inp = base_input.clone();
+                    inp["entity_uri"] = serde_json::Value::String((*uri).to_string());
+                    inp
+                },
+                dependency_indices: vec![],
+                max_retries: 2,
+            })
+            .collect();
+
+        Self {
+            priority_groups: if tasks.is_empty() {
+                vec![]
+            } else {
+                vec![tasks]
+            },
+            document_name: document_name.to_string(),
+        }
+    }
 }
 
 /// The task scheduler.
@@ -477,6 +572,66 @@ mod tests {
         let ids = scheduler.create_from_plan(&plan).unwrap();
         // Analysis plan should create: repo_analyze + extract_metadata + extract_arch + data_model + extract_module + ui + tests + design_decisions + validate
         assert_eq!(ids.len(), 9, "Should create 9 tasks");
+    }
+
+    #[test]
+    fn test_llm_analysis_plan_creation() {
+        // No DB required: the plan generator is pure-functional, so we just
+        // exercise the priority-group shape directly.
+        let files = ["src/main.rs", "src/lib.rs", "src/config.rs"];
+        let plan = TaskPlan::llm_analysis_plan("test-doc", "/tmp/repo", &files);
+        assert_eq!(plan.priority_groups.len(), 1, "all files in one priority group");
+        let group = &plan.priority_groups[0];
+        assert_eq!(group.len(), 3, "one task per file");
+        for (i, t) in group.iter().enumerate() {
+            assert_eq!(t.task_type, TaskType::LlmAnalyzeFile);
+            assert_eq!(t.priority, 8);
+            assert_eq!(t.max_retries, 2);
+            assert!(t.dependency_indices.is_empty(), "files are independent");
+            assert_eq!(
+                t.input["file_path"],
+                serde_json::Value::String(files[i].to_string())
+            );
+            assert_eq!(t.input["document"], serde_json::Value::String("test-doc".into()));
+            assert_eq!(t.input["repo_path"], serde_json::Value::String("/tmp/repo".into()));
+        }
+        assert_eq!(plan.document_name, "test-doc");
+    }
+
+    #[test]
+    fn test_llm_analysis_plan_empty_files() {
+        let plan = TaskPlan::llm_analysis_plan("test-doc", "/tmp/repo", &[]);
+        assert!(plan.priority_groups.is_empty());
+    }
+
+    #[test]
+    fn test_llm_generation_plan_creation() {
+        let entities = ["sdef://proj/User", "sdef://proj/Post", "sdef://proj/Comment"];
+        let plan = TaskPlan::llm_generation_plan("test-doc", "rust", &entities);
+        assert_eq!(plan.priority_groups.len(), 1, "all entities in one priority group");
+        let group = &plan.priority_groups[0];
+        assert_eq!(group.len(), 3, "one task per entity");
+        for (i, t) in group.iter().enumerate() {
+            assert_eq!(t.task_type, TaskType::LlmGenerateCode);
+            assert_eq!(t.priority, 8);
+            assert_eq!(t.max_retries, 2);
+            assert!(t.dependency_indices.is_empty());
+            assert_eq!(
+                t.input["entity_uri"],
+                serde_json::Value::String(entities[i].to_string())
+            );
+            assert_eq!(t.input["target_language"], serde_json::Value::String("rust".into()));
+        }
+    }
+
+    #[test]
+    fn test_llm_task_type_roundtrip() {
+        // `as_str` and `from_str` must be mutual inverses for the new variants.
+        for tt in [TaskType::LlmAnalyzeFile, TaskType::LlmGenerateCode] {
+            let s = tt.as_str();
+            let back = TaskType::from_str(s).expect("from_str should accept as_str output");
+            assert_eq!(back, tt, "roundtrip mismatch for {s}");
+        }
     }
 
     #[test]

@@ -34,6 +34,9 @@ schemars = "0.8"
 # features: openai 走 OpenAI 兼容协议,minimax 走其自家 provider(虽然示例用老域名,
 # 但 base_url 可 override),anthropic 备用,logging 看请求细节
 autoagents = { version = "0.3.7", features = ["openai", "minimax", "anthropic", "logging"], default-features = false }
+# `autoagents-derive` provides the `#[agent]` proc macro used by `BasicAgent`
+# integration in `llm_loop::run_loop_via_basic_agent`.
+autoagents-derive = { version = "0.3.7", default-features = false }
 
 # 之前评估的另外 2 个候选 — 已淘汰,不再作为依赖
 # adk-rust: 0.9.1 ThinkingBlock.signature 字段缺 #[serde(default)],MiniMax 流式响应失败

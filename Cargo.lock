@@ -416,6 +416,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autoagents",
+ "autoagents-derive",
  "blake3",
  "chrono",
  "cleanroom-db",

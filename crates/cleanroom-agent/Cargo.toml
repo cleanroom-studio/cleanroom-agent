@@ -11,6 +11,8 @@ cleanroom-prompt = { path = "../cleanroom-prompt" }
 sdef-core = { path = "../sdef-core" }
 # LLM agent framework — 唯一选定的 autoagents
 autoagents.workspace = true
+# `#[agent]` proc macro used by `llm_loop::run_loop_via_basic_agent`
+autoagents-derive.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true
