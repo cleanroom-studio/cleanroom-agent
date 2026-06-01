@@ -12,17 +12,19 @@ that can be regenerated on demand, much like a "clean room" implementation — h
 
 ## How It Works
 
-```
-  Source Repository              S.DEF Document              Generated Code
-  (any language)                 (language-agnostic)          (any language)
-
-  ┌─────────────────┐           ┌──────────────────┐         ┌─────────────────┐
-  │ TypeScript      │           │                  │         │ Rust structs     │
-  │ Python          │──Produce──│ Data Models      │──Consume│ Python classes   │
-  │ Go              │           │ Contracts        │         │ TypeScript types  │
-  │ C/C++           │           │ Functions         │         │ C headers        │
-  │ Java/Rust/...   │           │ Architecture     │         │ ...              │
-  └─────────────────┘           └──────────────────┘         └─────────────────┘
+```mermaid
+flowchart LR
+    subgraph SRC["Source Repository<br/>(any language)"]
+        S1["TypeScript / Python / Go / C, C++ / Java / Rust / ..."]
+    end
+    subgraph SDEF["S.DEF Document<br/>(language-agnostic)"]
+        D1["Data Models<br/>Contracts<br/>Functions<br/>Architecture<br/>Design Decisions"]
+    end
+    subgraph CODE["Generated Code<br/>(any language)"]
+        C1["Rust structs<br/>Python classes<br/>TypeScript types<br/>C headers<br/>..."]
+    end
+    SRC -- "**Produce**" --> SDEF
+    SDEF -- "**Consume**" --> CODE
 ```
 
 - **Produce**: Analyze source code with tree-sitter + optional LSP → extract entities into S.DEF
@@ -109,44 +111,106 @@ cargo run -- inspect --check-type <consistency|coverage|progress> [--queue]
 
 ---
 
+## LLM Evaluation
+
+The agent runtime is built on top of **`cleanroom-meta`** — an in-tree vendored
+fork of `autoagents` 0.3.7 (5 workspace crates: `cleanroom-meta`,
+`cleanroom-meta-protocol`, `cleanroom-meta-llm`, `cleanroom-meta-derive`,
+`cleanroom-meta-core`). It keeps only the 3 LLM backends we actually use
+(OpenAI / Anthropic / MiniMax) and is wired through a `Meta*` symbol prefix
+to avoid colliding with user code.
+
+Two `examples/` are the canonical smoke tests for the LLM path; both talk to
+the real MiniMax-M3 endpoint and report token / timing stats:
+
+| Example | Path | Purpose |
+|---------|------|---------|
+| `eval_meta` | `crates/cleanroom-agent/examples/eval_meta.rs` | Raw `MetaProvider::chat()` call through each of the 3 LLM backends (`EVAL_PROVIDER=openai` / `anthropic` / `minimax`). |
+| `eval_llm_loop` | `crates/cleanroom-agent/examples/eval_llm_loop.rs` | End-to-end exercise of `llm_loop::run_loop_via_basic_agent` (the path Phase 0.5 will use for Producer / Consumer). |
+
+```bash
+# Pre-req: drop a `.env` with one of:
+#   MINIMAX_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY
+
+# 1. Raw chat() round-trip (default: openai-compatible)
+cargo run --manifest-path cleanroom-agent/Cargo.toml \
+  -p cleanroom-agent --example eval_meta
+
+# 2. End-to-end via the MetaBasicAgent + MetaDirectAgent path
+cargo run --manifest-path cleanroom-agent/Cargo.toml \
+  -p cleanroom-agent --example eval_llm_loop
+
+# Override the model, system prompt, or user prompt via env vars
+EVAL_MODEL=MiniMax-M3 \
+EVAL_PROVIDER=anthropic \
+EVAL_PROMPT="What is 2+2? Answer in one sentence." \
+  cargo run --manifest-path cleanroom-agent/Cargo.toml \
+    -p cleanroom-agent --example eval_llm_loop
+```
+
+See `PLAN.md` §"Vendor `cleanroom-meta` — 重命名映射表" for the symbol rename
+map (e.g. `ChatProvider` → `MetaProvider`, `#[agent]` → `#[meta_agent]`,
+`LLMBuilder` → `MetaBuilder`).
+
+---
+
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Cleanroom Agent                                  │
-│                                                                          │
-│  ┌────────────────────────┐     ┌────────────────────────────────────┐   │
-│  │      MCP Server        │     │     SQLite State DB (state.db)      │   │
-│  │  (rmcp SDK + 50+ tools)│     │  tasks | shards | data_models | ... │   │
-│  └──────────┬─────────────┘     └────────────────────────────────────┘   │
-│             │                          ▲                                │
-│  ┌──────────▼──────────────────────────┴────────────────────────────┐   │
-│  │                     Agent Runtime (adk-rust)                      │   │
-│  │                                                                   │   │
-│  │  ┌──────────────────┐  ┌──────────────────┐  ┌────────────────┐  │   │
-│  │  │  Producer Agent  │  │  Consumer Agent  │  │  Orchestrator  │  │   │
-│  │  │ (Code → S.DEF)   │  │ (S.DEF → Code)   │  │ (Task Queue)   │  │   │
-│  │  │  • tree-sitter   │  │  • Code Gen      │  │  • Scheduling  │  │   │
-│  │  │  • LSP Analysis  │  │  • Verification  │  │  • Health      │  │   │
-│  │  │  • Dep Graph     │  │  • Compatibility │  │  • Checkpoints │  │   │
-│  │  └──────────────────┘  └──────────────────┘  └────────────────┘  │   │
-│  └───────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph IO["I/O Layer"]
+        MCP["<b>MCP Server</b><br/>(rmcp SDK + 50+ tools)"]
+        DB["<b>SQLite State DB (state.db)</b><br/>tasks &middot; shards &middot; data_models &middot; ..."]
+    end
+    subgraph RUNTIME["Agent Runtime — cleanroom-meta (vendored)"]
+        subgraph AGENTS[" "]
+            P["<b>Producer Agent</b><br/>(Code → S.DEF)<br/>&bull; tree-sitter<br/>&bull; LSP Analysis<br/>&bull; Dep Graph<br/>&bull; LLM (Meta*)"]
+            C["<b>Consumer Agent</b><br/>(S.DEF → Code)<br/>&bull; Code Gen<br/>&bull; Verification<br/>&bull; Compatibility<br/>&bull; LLM (Meta*)"]
+            O["<b>Orchestrator</b><br/>(Task Queue)<br/>&bull; Scheduling<br/>&bull; Health<br/>&bull; Checkpoints<br/>&bull; LLM (Meta*)"]
+        end
+    end
+    P <-->|tools / status| MCP
+    C <-->|tools / status| MCP
+    O <-->|claim / heartbeat| MCP
+    P <-->|read / write| DB
+    C <-->|read / write| DB
+    O <-->|task queue| DB
 ```
 
 ### Crate Dependency Graph
 
-```
-cleanroom-cli (CLI entry, MCP client)
-  ├── cleanroom-agent (Orchestrator, Producer, Consumer, Scheduler)
-  │     ├── cleanroom-db ───→ sdef-core
-  │     ├── cleanroom-lsp ───→ sdef-core
-  │     └── sdef-core (independent)
-  ├── cleanroom-mcp (MCP server, 50+ tools)
-  │     ├── cleanroom-db ───→ sdef-core
-  │     ├── cleanroom-i18n
-  │     └── sdef-core
-  └── cleanroom-i18n (internationalization)
+```mermaid
+flowchart TD
+    cli["<b>cleanroom-cli</b><br/>(CLI entry, MCP client)"]
+    agent["<b>cleanroom-agent</b><br/>(Orchestrator, Producer, Consumer, Scheduler)"]
+    mcp["<b>cleanroom-mcp</b><br/>(MCP server, 50+ tools)"]
+    i18n["<b>cleanroom-i18n</b><br/>(internationalization)"]
+    db["cleanroom-db"]
+    lsp["cleanroom-lsp"]
+    sdef["<b>sdef-core</b><br/>(independent)"]
+    meta_llm["<b>cleanroom-meta-llm</b><br/>(LLM provider abstraction,<br/>OpenAI / Anthropic / MiniMax)"]
+    meta_core["<b>cleanroom-meta-core</b><br/>(agent runtime:<br/>MetaAgentBuilder, MetaBasicAgent)"]
+    meta_derive["<b>cleanroom-meta-derive</b><br/>(#[meta_agent] / MetaHooks proc macros)"]
+    meta["<b>cleanroom-meta</b><br/>(facade:<br/>::cleanroom_meta::async_trait re-export)"]
+
+    cli --> agent
+    cli --> mcp
+    cli --> i18n
+
+    agent --> db
+    agent --> lsp
+    agent --> meta_llm
+    agent --> meta_core
+    agent --> meta_derive
+    agent --> meta
+    agent --> sdef
+
+    mcp --> db
+    mcp --> i18n
+    mcp --> sdef
+
+    db --> sdef
+    lsp --> sdef
 ```
 
 | Crate | Role |
@@ -159,6 +223,7 @@ cleanroom-cli (CLI entry, MCP client)
 | `cleanroom-cli` | CLI entry point (all subcommands, MCP client) |
 | `cleanroom-i18n` | Internationalization (Chinese/English) |
 | `cleanroom-prompt` | LLM system prompt generation |
+| `cleanroom-meta` *(+ 4 subcrates)* | Vendored autoagents 0.3.7 fork; LLM agent runtime (facade + protocol + llm + derive + core) |
 
 ---
 
@@ -244,40 +309,66 @@ cargo clippy
 
 ### Project Structure
 
-```
-cleanroom-agent/
-├── Cargo.toml              # Workspace root
-├── crates/
-│   ├── sdef-core/          # S.DEF type definitions
-│   ├── cleanroom-db/       # Database layer
-│   │   ├── src/
-│   │   │   ├── database.rs     # Database, BackupConfig
-│   │   │   ├── repositories/   # Task, Shard, Symbol, etc.
-│   │   │   └── export_import/  # S.DEF ↔ DB synchronization
-│   │   └── migrations/    # SQL migrations
-│   ├── cleanroom-mcp/      # MCP Server
-│   │   └── src/tools/      # Tool implementations (50+ MCP tools)
-│   ├── cleanroom-lsp/      # LSP client
-│   │   └── src/server_pool.rs  # LSP server pool
-│   ├── cleanroom-agent/    # Agent core logic
-│   │   └── src/
-│   │       ├── agent.rs        # Top-level CleanroomAgent
-│   │       ├── orchestrator.rs # Workflow coordination
-│   │       ├── producer.rs     # Producer agent
-│   │       ├── consumer.rs     # Consumer agent
-│   │       │   └── code_generator/  # Rust/TS/Python/C generators
-│   │       ├── scheduler.rs    # Task scheduling
-│   │       ├── ir_to_sdef.rs   # IR → S.DEF mapping
-│   │       ├── repo_scanner.rs # File discovery
-│   │       └── retry.rs        # Exponential backoff
-│   ├── cleanroom-cli/      # CLI entry point
-│   │   └── src/
-│   │       ├── main.rs         # Argument parsing
-│   │       └── commands/       # Command handlers
-│   ├── cleanroom-i18n/     # Internationalization
-│   └── cleanroom-prompt/   # LLM prompt templates
-├── docs/                   # Design documents (18 chapters)
-└── AGENTS.md               # AI agent development guide
+```mermaid
+flowchart TD
+    classDef root fill:#fef3c7,stroke:#92400e
+    classDef crate fill:#dbeafe,stroke:#1e3a8a
+    classDef dir fill:#dcfce7,stroke:#14532d
+    classDef file fill:#f3f4f6,stroke:#374151
+
+    root["<b>cleanroom-agent/</b>"]:::root
+    root_cargo["Cargo.toml &mdash; Workspace root"]:::file
+    root_docs["docs/ &mdash; Design documents (18 chapters)"]:::dir
+    root_agents["AGENTS.md &mdash; AI agent development guide"]:::file
+    crates["crates/"]:::dir
+
+    sdef_core["sdef-core/ &mdash; S.DEF type definitions"]:::crate
+
+    db_crate["cleanroom-db/ &mdash; Database layer"]:::crate
+    db_src["src/ &mdash; database.rs, repositories/, export_import/"]:::dir
+    db_mig["migrations/ &mdash; SQL migration files"]:::dir
+
+    mcp_crate["cleanroom-mcp/ &mdash; MCP Server"]:::crate
+    mcp_tools["src/tools/ &mdash; 50+ MCP tool implementations"]:::dir
+
+    lsp_crate["cleanroom-lsp/ &mdash; LSP client"]:::crate
+    lsp_pool["src/server_pool.rs &mdash; LSP server pool"]:::file
+
+    agent_crate["cleanroom-agent/ &mdash; Agent core logic"]:::crate
+    agent_src["src/ &mdash; agent.rs, orchestrator.rs, producer.rs, ..."]:::dir
+    agent_codegen["code_generator/ &mdash; Rust/TS/Python/C generators"]:::dir
+    agent_extras["ir_to_sdef.rs, repo_scanner.rs, retry.rs, scheduler.rs"]:::file
+
+    cli_crate["cleanroom-cli/ &mdash; CLI entry point"]:::crate
+    cli_src["src/ &mdash; main.rs, commands/"]:::dir
+
+    i18n_crate["cleanroom-i18n/ &mdash; Internationalization"]:::crate
+    prompt_crate["cleanroom-prompt/ &mdash; LLM prompt templates"]:::crate
+
+    root --> root_cargo
+    root --> root_docs
+    root --> root_agents
+    root --> crates
+
+    crates --> sdef_core
+    crates --> db_crate
+    crates --> mcp_crate
+    crates --> lsp_crate
+    crates --> agent_crate
+    crates --> cli_crate
+    crates --> i18n_crate
+    crates --> prompt_crate
+
+    db_crate --> db_src
+    db_crate --> db_mig
+    mcp_crate --> mcp_tools
+    lsp_crate --> lsp_pool
+
+    agent_crate --> agent_src
+    agent_src --> agent_codegen
+    agent_src --> agent_extras
+
+    cli_crate --> cli_src
 ```
 
 ### Coding Conventions
