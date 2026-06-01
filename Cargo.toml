@@ -25,8 +25,20 @@ rmcp = { version = "1.7", features = ["server", "macros"] }
 rmcp-macros = "1.7"
 schemars = "0.8"
 
-# Agent Framework — MiniMax 使用 Anthropic 兼容接口
-adk-rust = { version = "0.9", features = ["anthropic"] }
+# Agent Framework — autoagents 0.3.7(Phase 0 评估后选定的)
+# - 唯一能跟 MiniMax-M3 (Anthropic 兼容 + OpenAI 兼容)端到端通讯的 Rust framework
+# - rig 的 Anthropic provider 把 URL hardcode 到 api.anthropic.com,且 OpenAI 反序列化
+#   跟 MiniMax 响应不完全兼容(JSON "null vs expected sequence")
+# - autoagents 的 OpenAI provider 接受 base_url override,2.5s 实测端到端通
+# - 配套有 BasicAgent + AgentBuilder 高层 API、ReAct executor、tool calling、structured output
+# features: openai 走 OpenAI 兼容协议,minimax 走其自家 provider(虽然示例用老域名,
+# 但 base_url 可 override),anthropic 备用,logging 看请求细节
+autoagents = { version = "0.3.7", features = ["openai", "minimax", "anthropic", "logging"], default-features = false }
+
+# 之前评估的另外 2 个候选 — 已淘汰,不再作为依赖
+# adk-rust: 0.9.1 ThinkingBlock.signature 字段缺 #[serde(default)],MiniMax 流式响应失败
+# rig-core 0.37: Anthropic provider URL hardcode + OpenAI provider 跟 MiniMax 响应不兼容
+# anda_engine 0.12: ICP / TEE 依赖过重,不适合我们的场景
 
 # Async Runtime
 tokio = { version = "1", features = ["full"] }

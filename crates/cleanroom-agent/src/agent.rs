@@ -1,7 +1,8 @@
-//! CleanroomAgent — top-level agent entry point using adk-rust.
+//! CleanroomAgent — top-level agent entry point for cleanroom-agent.
 //!
-//! Wraps an adk-rust LLM agent alongside database connectivity,
-//! providing a unified entry point for produce/consume/resume modes.
+//! Coordinates the Produce/Consume pipelines and prompt engineering infrastructure.
+//! LLM interaction is delegated to [`crate::llm_loop`], which wraps `autoagents`'s
+//! `ChatProvider` trait (Phase 0 选定的 LLM framework)。
 //!
 //! Uses cleanroom-prompt for structured prompt engineering:
 //! role definition, context budgeting, tool orchestration, etc.
@@ -231,8 +232,9 @@ impl AgentConfig {
 
 /// The top-level Cleanroom Agent.
 ///
-/// Wraps an adk-rust `LlmAgent` for LLM interaction capabilities,
-/// alongside database connectivity and prompt engineering infrastructure.
+/// Coordinates the Produce/Consume pipelines and prompt engineering infrastructure.
+/// LLM interaction is delegated to [`crate::llm_loop`], which wraps `autoagents`'s
+/// `ChatProvider` trait (Phase 0 选定的 framework)。
 ///
 /// This is the main entry point for the Cleanroom agent system. It supports
 /// three run modes: Produce (code → S.DEF), Consume (S.DEF → code), and
@@ -268,8 +270,6 @@ impl AgentConfig {
 pub struct CleanroomAgent {
     /// Database connection for state persistence and S.DEF storage
     pub db: Arc<Database>,
-    /// adk-rust LLM agent for LLM-driven tasks (None if no provider available)
-    pub llm_agent: Option<Arc<dyn adk_rust::Agent>>,
     /// Prompt builder for structured LLM interaction
     pub prompt_builder: PromptBuilder,
     /// Few-shot example manager loaded from database on startup
@@ -318,35 +318,15 @@ impl CleanroomAgent {
             FewShotManager::new(10, 100)
         };
 
-        // Generate the system prompt from config
-        let system_prompt = cleanroom_prompt::build_system_prompt(&config.prompt_config);
+        // Generate the system prompt from config (kept for future tool-call sessions)
+        let _system_prompt = cleanroom_prompt::build_system_prompt(&config.prompt_config);
 
-        // Build adk-rust LLM agent if env provider is available
-        let llm_agent = match adk_rust::provider_from_env() {
-            Ok(model) => {
-                let agent = match adk_rust::agent::LlmAgentBuilder::new(&config.agent_name)
-                    .description("Cleanroom Agent - S.DEF intelligent agent system")
-                    .instruction(&system_prompt.text)
-                    .model(model)
-                    .build()
-                {
-                    Ok(a) => Some(Arc::new(a) as Arc<dyn adk_rust::Agent>),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "LlmAgent build failed; continuing without LLM");
-                        None
-                    }
-                };
-                agent
-            }
-            Err(e) => {
-                tracing::info!(error = %e, "No LLM provider available; running without LLM capabilities");
-                None
-            }
-        };
+        // LLM agent construction is delegated to crate::llm_loop::run_loop, which
+        // builds an autoagents LLM via LLMBuilder at call time. We no longer hold
+        // a long-lived LLM agent on CleanroomAgent.
 
         Ok(Self {
             db: Arc::new(db),
-            llm_agent,
             prompt_builder,
             few_shot,
             config,
@@ -574,7 +554,6 @@ impl std::fmt::Debug for CleanroomAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CleanroomAgent")
             .field("db_path", &self.config.db_path)
-            .field("has_llm", &self.llm_agent.is_some())
             .field("few_shot_count", &self.few_shot.total_count())
             .finish()
     }

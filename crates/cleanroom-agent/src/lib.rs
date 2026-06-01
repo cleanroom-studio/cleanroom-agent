@@ -57,6 +57,7 @@ pub mod agent;
 pub mod orchestrator;
 pub mod producer;
 pub mod consumer;
+pub mod llm_loop;
 pub mod naming;
 pub mod name_resolution;
 pub mod consistency;
@@ -103,6 +104,11 @@ pub mod reviewer;
 pub mod evaluation;
 
 pub use agent::{CleanroomAgent, AgentConfig, RunMode};
+
+// LLM agent loop (Phase 0.1) — wraps `autoagents::llm::chat::ChatProvider`.
+// Phase 0.5 会切到 `autoagents::core::agent::AgentBuilder` + `BasicAgent` 实现
+// 多轮 ReAct + tool-calling,公共 API 保持稳定。
+pub use llm_loop::{run_loop, LoopConfig, LoopContext, LoopError, LoopOutcome, LoopStats};
 pub use naming::{DeterministicNames, Language, NameStyle, NamespaceMode};
 pub use name_resolution::{NameResolutionService, ResolvedName};
 pub use orchestrator::{Orchestrator, OrchestratorConfig, pid_file_path, port_file_path, read_port_file, write_port_file};

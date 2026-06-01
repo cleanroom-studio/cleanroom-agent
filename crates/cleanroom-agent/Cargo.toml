@@ -9,7 +9,8 @@ cleanroom-db = { path = "../cleanroom-db" }
 cleanroom-lsp = { path = "../cleanroom-lsp" }
 cleanroom-prompt = { path = "../cleanroom-prompt" }
 sdef-core = { path = "../sdef-core" }
-adk-rust.workspace = true
+# LLM agent framework — 唯一选定的 autoagents
+autoagents.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true
@@ -17,6 +18,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 blake3.workspace = true
@@ -44,3 +46,6 @@ tree-sitter-lua.workspace = true
 tree-sitter-bash.workspace = true
 tree-sitter-json.workspace = true
 tree-sitter-yaml.workspace = true
+
+[dev-dependencies]
+# examples 不需要再带 — autoagents 已经是主依赖
