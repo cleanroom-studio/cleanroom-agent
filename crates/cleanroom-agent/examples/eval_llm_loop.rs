@@ -185,6 +185,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         temperature: 0.0,
         tool_timeout_secs: 30,
         cost_limit_usd: Some(0.05),
+        on_call_complete: None,
     };
 
     println!("== run_loop_via_basic_agent start ==");

@@ -21,3 +21,7 @@ pub use repositories::{TypeCacheEntry, TypeCacheRepository};
 pub use repositories::{
     EvaluationRecord, EvaluationRepository, EvaluationSummary, EvaluationTrend,
 };
+pub use repositories::{
+    LlmCallLog, LlmCallLogRepository, STATUS_ABORTED, STATUS_COMPLETED, STATUS_FAILED,
+    STATUS_MAX_ITER, STATUS_REFUSED,
+};

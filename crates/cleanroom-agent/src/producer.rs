@@ -42,7 +42,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use cleanroom_db::{Database, DbError, Task, TaskRepository, TaskStatus, TaskType};
+use cleanroom_db::{
+    Database, DbError, LlmCallLogRepository, Task, TaskRepository, TaskStatus, TaskType,
+};
 use cleanroom_meta_llm::MetaLlm;
 use tracing::{info, instrument, warn};
 
@@ -152,6 +154,10 @@ pub struct ProducerAgent {
     llm: Option<Arc<dyn MetaLlm>>,
     /// Loop config used for `LlmAnalyzeFile` tasks (token / cost limits).
     loop_config: LoopConfig,
+    /// Optional Phase 0.9 audit logger. When set, every `run_loop`
+    /// invocation will fire `LoopConfig::on_call_complete` to persist
+    /// the call record to the `llm_call_log` table.
+    llm_call_logger: Option<Arc<LlmCallLogRepository>>,
 }
 
 impl ProducerAgent {
@@ -164,6 +170,7 @@ impl ProducerAgent {
             agent_id,
             llm: None,
             loop_config: LoopConfig::default(),
+            llm_call_logger: None,
         }
     }
 
@@ -178,6 +185,14 @@ impl ProducerAgent {
     /// Set the LLM loop config (token / iteration / cost guardrails).
     pub fn with_loop_config(mut self, cfg: LoopConfig) -> Self {
         self.loop_config = cfg;
+        self
+    }
+
+    /// Attach an `llm_call_log` audit logger (Phase 0.9). Once set,
+    /// every `run_loop` invocation will receive an `on_call_complete`
+    /// callback that writes a row to the `llm_call_log` table.
+    pub fn with_llm_call_logger(mut self, logger: Arc<LlmCallLogRepository>) -> Self {
+        self.llm_call_logger = Some(logger);
         self
     }
 
@@ -457,14 +472,37 @@ impl ProducerAgent {
         );
 
         // 4. Call the LLM.
+        // Phase 0.9: build a per-call LoopConfig so we can attach the
+        // `on_call_complete` audit-log hook without mutating the shared
+        // `self.loop_config`. The hook (if `llm_call_logger` is set)
+        // persists every LLM call to the `llm_call_log` table.
+        let mut loop_cfg = self.loop_config.clone();
+        if let Some(logger) = self.llm_call_logger.clone() {
+            loop_cfg.on_call_complete = Some(Arc::new(move |log: cleanroom_db::LlmCallLog| {
+                if let Err(e) = logger.create(&log) {
+                    tracing::warn!(
+                        error = %e,
+                        call_id = %log.call_id,
+                        "llm_call_log: failed to persist LlmCallLog"
+                    );
+                }
+            }));
+        }
+        // Best-effort model name for the audit log: try `EVAL_MODEL`
+        // (the same env var `build_llm_from_env` consults); fall back
+        // to `"unknown"`. Phase 1+ will plumb the model through
+        // `with_llm` so this is no longer needed.
+        let model_name = std::env::var("EVAL_MODEL")
+            .unwrap_or_else(|_| "unknown".to_string());
         let ctx = LoopContext::new(
             &task.task_id,
             "producer-llm-session",
             "cleanroom-producer",
             system_prompt,
             user_message,
-        );
-        let outcome = run_loop(llm.clone(), ctx, &self.loop_config)
+        )
+        .with_model(model_name);
+        let outcome = run_loop(llm.clone(), ctx, &loop_cfg)
             .await
             .map_err(|e| DbError::QueryFailed(format!("LLM call failed: {e}")))?;
 

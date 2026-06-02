@@ -190,6 +190,12 @@ impl Database {
         let conn = db.conn.lock().unwrap();
         conn.execute_batch(crate::embedded_schema::INITIAL_SCHEMA_SQL)
             .map_err(|e| DbError::MigrationFailed(e.to_string()))?;
+        // Phase 0.9: also apply the LLM call log table (migrations/008).
+        // Production paths apply it via `run_pending_at`; the in-memory
+        // test factory needs it here so unit tests for the
+        // `LlmCallLogRepository` can run without a migrations directory.
+        conn.execute_batch(crate::embedded_schema::LLM_CALL_LOG_SCHEMA_SQL)
+            .map_err(|e| DbError::MigrationFailed(e.to_string()))?;
         drop(conn);
         Ok(db)
     }

@@ -58,6 +58,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
+use cleanroom_db::LlmCallLog;
 use cleanroom_meta_core::agent::prebuilt::executor::{MetaBasicAgent, MetaBasicAgentOutput};
 use cleanroom_meta_core::agent::task::MetaTask;
 use cleanroom_meta_core::agent::{MetaAgentBuilder, MetaOutputT, MetaDirectAgent};
@@ -73,14 +74,14 @@ use cleanroom_meta_derive::{MetaHooks, MetaOutput, meta_agent};
 use cleanroom_meta_llm::error::MetaError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 // ============================================================================
 // Public types
 // ============================================================================
 
 /// Tuning parameters + cost guardrail for one `run_loop` invocation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LoopConfig {
     /// Maximum number of LLM round-trips. Reserved in the Phase 0.1 single-shot
     /// chat implementation; will be used once Phase 0.5 switches to
@@ -100,6 +101,27 @@ pub struct LoopConfig {
     /// `run_loop` short-circuits with `LoopOutcome::Aborted`. `None` disables
     /// the cap.
     pub cost_limit_usd: Option<f64>,
+    /// Optional callback fired after each LLM call (Phase 0.9). Receives
+    /// an owned [`LlmCallLog`] describing the call (status, tokens,
+    /// duration, cost, optional error). The default impl constructs
+    /// `None`; callers (e.g. the Producer) opt in by setting this to
+    /// a closure that writes the record somewhere (typically the
+    /// `llm_call_log` table). The closure runs on the LLM-loop task;
+    /// keep it fast and non-blocking.
+    pub on_call_complete: Option<Arc<dyn Fn(LlmCallLog) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for LoopConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopConfig")
+            .field("max_iterations", &self.max_iterations)
+            .field("max_tokens_per_call", &self.max_tokens_per_call)
+            .field("temperature", &self.temperature)
+            .field("tool_timeout_secs", &self.tool_timeout_secs)
+            .field("cost_limit_usd", &self.cost_limit_usd)
+            .field("on_call_complete", &self.on_call_complete.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
 }
 
 impl Default for LoopConfig {
@@ -110,6 +132,7 @@ impl Default for LoopConfig {
             temperature: 0.2,
             tool_timeout_secs: 60,
             cost_limit_usd: None,
+            on_call_complete: None,
         }
     }
 }
@@ -131,6 +154,10 @@ pub struct LoopContext {
     pub system_prompt: String,
     /// First user message, maps to `role=user`.
     pub initial_user_message: String,
+    /// Model name (Phase 0.9: surfaced in `llm_call_log`). Set via
+    /// [`LoopContext::with_model`]; defaults to `None` for backwards
+    /// compatibility with the 5-arg `new()` constructor.
+    pub model: Option<String>,
     /// Internal handle to the live stats accumulator.
     stats: Arc<Mutex<LoopStats>>,
 }
@@ -150,8 +177,16 @@ impl LoopContext {
             app_name: app_name.into(),
             system_prompt: system_prompt.into(),
             initial_user_message: initial_user_message.into(),
+            model: None,
             stats: Arc::new(Mutex::new(LoopStats::default())),
         }
+    }
+
+    /// Builder-style: set the LLM model name (used by the
+    /// `on_call_complete` hook to populate `LlmCallLog::model`).
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 
     /// Borrow the internal stats handle; callers can `lock().snapshot()` to
@@ -278,6 +313,13 @@ pub async fn run_loop(
         s.cost_estimate_usd = estimate_cost(s.prompt_tokens, s.completion_tokens);
     }
     let snapshot = lock_stats(&stats).clone();
+
+    // Phase 0.9: fire the on_call_complete hook (if attached) with a
+    // `completed` record. We do this even though the outcome may later
+    // be downgraded to `Aborted` (cost guard) or `LlmRefused` (empty
+    // response) — the hook records the LLM call *event*, not the
+    // caller's downstream decision.
+    fire_on_call_complete(cfg, &ctx, &snapshot, "completed", None);
 
     info!(
         task_id = %ctx.task_id,
@@ -444,6 +486,10 @@ pub async fn run_loop_via_basic_agent(
             estimate_cost(s.prompt_tokens, s.completion_tokens);
     }
     let snapshot = lock_stats(&stats).clone();
+
+    // Phase 0.9: see `run_loop` for the rationale behind firing the
+    // hook with status="completed" regardless of downstream outcome.
+    fire_on_call_complete(cfg, &ctx, &snapshot, "completed", None);
 
     info!(
         task_id = %ctx.task_id,
@@ -647,6 +693,54 @@ fn estimate_cost(prompt_tokens: u32, completion_tokens: u32) -> f64 {
     input_cost + output_cost
 }
 
+/// Phase 0.9: fire the `LoopConfig::on_call_complete` hook with a
+/// freshly-built [`LlmCallLog`] record. `status` is one of `"completed"` /
+/// `"aborted"` / `"max_iter"` / `"refused"` / `"failed"`. `error` is set
+/// for non-completed statuses.
+///
+/// The hook is invoked synchronously on the LLM-loop task; keep the
+/// closure non-blocking (e.g. a fire-and-forget DB insert). Any panic in
+/// the closure is logged + swallowed so a logging failure can never
+/// take down the loop.
+fn fire_on_call_complete(
+    cfg: &LoopConfig,
+    ctx: &LoopContext,
+    snapshot: &LoopStats,
+    status: &str,
+    error: Option<String>,
+) {
+    let Some(cb) = cfg.on_call_complete.as_ref() else {
+        return;
+    };
+    let log = LlmCallLog {
+        call_id: format!("call-{}", uuid::Uuid::new_v4()),
+        task_id: Some(ctx.task_id.clone()),
+        session_id: Some(ctx.session_id.clone()),
+        agent_type: "meta".to_string(),
+        app_name: Some(ctx.app_name.clone()),
+        model: ctx.model.clone(),
+        prompt_tokens: snapshot.prompt_tokens,
+        completion_tokens: snapshot.completion_tokens,
+        duration_ms: snapshot.elapsed_ms,
+        iterations: snapshot.iterations,
+        tool_calls: snapshot.tool_calls,
+        cost_estimate_usd: snapshot.cost_estimate_usd,
+        status: status.to_string(),
+        error,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    // Std::panic::catch_unwind to make the hook non-fatal.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cb(log);
+    }));
+    if result.is_err() {
+        warn!(
+            task_id = %ctx.task_id,
+            "on_call_complete hook panicked; logging failure is non-fatal"
+        );
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -813,4 +907,148 @@ mod usage_capturing_tests {
     /// Marker constant so the `assert_arc_dyn_compat_is_a_valid_fn_pointer`
     /// reference above is "used" even when the test doesn't run anything.
     const assert_arc_dyn_compat_is_a_valid_fn_pointer: () = ();
+}
+
+// ============================================================================
+// Phase 0.9: `on_call_complete` hook tests
+//
+// `fire_on_call_complete` is a tiny helper but its contract has three
+// non-obvious properties worth locking down:
+//   1. `None` hook is a true no-op (no allocations, no lock).
+//   2. The hook receives a fully-populated `LlmCallLog` (every field
+//      populated from `LoopContext` / `LoopStats`).
+//   3. A panicking hook does NOT propagate to the loop — logging is a
+//      side-channel, never load-bearing.
+// ============================================================================
+#[cfg(test)]
+mod on_call_complete_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn sample_ctx() -> LoopContext {
+        LoopContext::new(
+            "task-1",
+            "session-1",
+            "cleanroom-producer",
+            "You are a code analyst.",
+            "Analyze src/main.rs",
+        )
+        .with_model("MiniMax-M3")
+    }
+
+    fn sample_stats() -> LoopStats {
+        LoopStats {
+            iterations: 1,
+            tool_calls: 0,
+            prompt_tokens: 522,
+            completion_tokens: 1024,
+            elapsed_ms: 29_400,
+            cost_estimate_usd: 0.0169,
+        }
+    }
+
+    #[test]
+    fn fire_with_no_hook_is_a_noop() {
+        let cfg = LoopConfig::default();
+        assert!(cfg.on_call_complete.is_none());
+        // Should not panic, should not allocate anything observable.
+        fire_on_call_complete(&cfg, &sample_ctx(), &sample_stats(), "completed", None);
+    }
+
+    #[test]
+    fn fire_invokes_hook_with_populated_record() {
+        let collected: Arc<StdMutex<Vec<LlmCallLog>>> = Arc::new(StdMutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+        let cfg = LoopConfig {
+            on_call_complete: Some(Arc::new(move |log: LlmCallLog| {
+                collected_clone.lock().unwrap().push(log);
+            })),
+            ..LoopConfig::default()
+        };
+        fire_on_call_complete(&cfg, &sample_ctx(), &sample_stats(), "completed", None);
+        let logs = collected.lock().unwrap();
+        assert_eq!(logs.len(), 1);
+        let log = &logs[0];
+        assert_eq!(log.task_id.as_deref(), Some("task-1"));
+        assert_eq!(log.session_id.as_deref(), Some("session-1"));
+        assert_eq!(log.app_name.as_deref(), Some("cleanroom-producer"));
+        assert_eq!(log.model.as_deref(), Some("MiniMax-M3"));
+        assert_eq!(log.agent_type, "meta");
+        assert_eq!(log.prompt_tokens, 522);
+        assert_eq!(log.completion_tokens, 1024);
+        assert_eq!(log.duration_ms, 29_400);
+        assert_eq!(log.iterations, 1);
+        assert_eq!(log.tool_calls, 0);
+        assert!((log.cost_estimate_usd - 0.0169).abs() < 1e-9);
+        assert_eq!(log.status, "completed");
+        assert!(log.error.is_none());
+        // call_id is auto-generated and unique.
+        assert!(log.call_id.starts_with("call-"));
+        // created_at is an RFC3339 timestamp.
+        assert!(log.created_at.contains('T'));
+    }
+
+    #[test]
+    fn fire_carries_status_and_error_fields() {
+        let collected: Arc<StdMutex<Vec<LlmCallLog>>> = Arc::new(StdMutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+        let cfg = LoopConfig {
+            on_call_complete: Some(Arc::new(move |log: LlmCallLog| {
+                collected_clone.lock().unwrap().push(log);
+            })),
+            ..LoopConfig::default()
+        };
+        fire_on_call_complete(
+            &cfg,
+            &sample_ctx(),
+            &sample_stats(),
+            "failed",
+            Some("transport error".to_string()),
+        );
+        let logs = collected.lock().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].status, "failed");
+        assert_eq!(logs[0].error.as_deref(), Some("transport error"));
+    }
+
+    #[test]
+    fn fire_swallows_hook_panic() {
+        // A panicking hook must NOT propagate — the loop should never
+        // crash because the audit log got an angry closure.
+        let cfg = LoopConfig {
+            on_call_complete: Some(Arc::new(|_log: LlmCallLog| {
+                panic!("intentional test panic in hook");
+            })),
+            ..LoopConfig::default()
+        };
+        // Should not panic, even though the hook does.
+        fire_on_call_complete(&cfg, &sample_ctx(), &sample_stats(), "completed", None);
+    }
+
+    #[test]
+    fn loop_context_with_model_sets_model_field() {
+        let ctx = LoopContext::new("t", "s", "a", "sp", "um").with_model("claude-3-5");
+        assert_eq!(ctx.model.as_deref(), Some("claude-3-5"));
+    }
+
+    #[test]
+    fn loop_context_without_with_model_has_none() {
+        let ctx = LoopContext::new("t", "s", "a", "sp", "um");
+        assert!(ctx.model.is_none());
+    }
+
+    #[test]
+    fn loop_config_debug_does_not_panic_with_hook() {
+        // `Debug` is hand-rolled to print "<fn>" for the hook so the
+        // closure doesn't get formatted. This is a smoke test against
+        // a future maintainer re-deriving `Debug` and accidentally
+        // calling `format!("{:?}", hook)` on a non-Debug closure.
+        let cfg = LoopConfig {
+            on_call_complete: Some(Arc::new(|_: LlmCallLog| {})),
+            ..LoopConfig::default()
+        };
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("on_call_complete"));
+        assert!(dbg.contains("<fn>"));
+    }
 }

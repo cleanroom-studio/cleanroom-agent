@@ -343,6 +343,57 @@ pub enum Commands {
         queue: bool,
     },
 
+    /// Phase 0.9: inspect the LLM call log (one row per `run_loop`).
+    ///
+    /// Every LLM call the agent makes (Producer `LlmAnalyzeFile`,
+    /// future Consumer `LlmGenerateCode`, etc.) is appended to the
+    /// `llm_call_log` table via `LoopConfig::on_call_complete`. This
+    /// command reads that table back so you can:
+    /// - audit token / cost usage per task
+    /// - debug prompt regressions (compare `prompt_tokens` /
+    ///   `completion_tokens` across runs)
+    /// - replay the conversation in a future UI / dashboard
+    ///
+    /// # Filters
+    ///
+    /// - `--task-id <UUID>` — list every call for a single task (oldest first)
+    /// - `--recent N` — list the N most recent calls across all tasks (newest first)
+    /// - `--agent-type <producer|consumer|meta>` — further filter
+    /// - `--format text|json` — human-readable (default) or newline-delimited JSON
+    ///
+    /// If neither `--task-id` nor `--recent` is supplied, defaults to
+    /// `--recent 20`.
+    ///
+    /// # Examples
+    ///
+    /// ```bash
+    /// # Recent 20 calls across all tasks
+    /// cleanroom inspect llm-log
+    ///
+    /// # All calls for one task
+    /// cleanroom inspect llm-log --task-id 1b31f20a-c1a7-43d8-9359-1f7417f3d7f0
+    ///
+    /// # Recent 5 calls in JSON for piping into jq
+    /// cleanroom inspect llm-log --recent 5 --format json | jq
+    /// ```
+    /// Phase 0.9: list the LLM call log (one row per `run_loop`).
+    ///
+    /// Reachable as either `llm-log` (canonical) or `inspect-llm-log` (alias
+    /// for the original PLAN.md call site). Defaults to the 20 most
+    /// recent calls. See `docs/11-prompt-engineering.md §10` for the
+    /// full prompt-engineering workflow built on top of this log.
+    #[clap(alias = "inspect-llm-log")]
+    LlmLog {
+        #[arg(long, conflicts_with = "recent")]
+        task_id: Option<String>,
+        #[arg(long)]
+        recent: Option<usize>,
+        #[arg(long)]
+        agent_type: Option<String>,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
     /// Export S.DEF document to JSON or YAML file.
     ///
     /// Reads a document from the database and serializes it to the specified
@@ -619,6 +670,15 @@ pub fn run(command: Commands, db_path: &str) -> Result<()> {
             } else {
                 inspect_command(&check_type, db_path)
             }
+        }
+        Commands::LlmLog { task_id, recent, agent_type, format } => {
+            llm_log_command(
+                task_id.as_deref(),
+                recent,
+                agent_type.as_deref(),
+                &format,
+                db_path,
+            )
         }
         Commands::Export { document, output, format } => {
             export_command(&document, &output, &format, db_path)
@@ -950,7 +1010,7 @@ async fn run_produce_one_pass(
         ProducerMode::Template => ProducerConfig::default(),
         ProducerMode::Both => ProducerConfig::both(),
     };
-    let mut producer = ProducerAgent::new(producer_config, db);
+    let mut producer = ProducerAgent::new(producer_config, db.clone());
     if matches!(mode, ProducerMode::Llm | ProducerMode::Both) {
         let llm = build_llm_from_env(model, api_key)?;
         producer = producer.with_llm(llm);
@@ -965,6 +1025,14 @@ async fn run_produce_one_pass(
         );
         producer = producer.with_loop_config(cfg);
     }
+    // Phase 0.9: wire the LLM call log so every `run_loop` invocation
+    // in this pass appends a row to `llm_call_log`. The repository
+    // reuses the same `Arc<Mutex<Connection>>` the producer already
+    // holds so we never open a second connection.
+    let log_repo = Arc::new(cleanroom_db::LlmCallLogRepository::new_with_arc(
+        db.connection_arc(),
+    ));
+    producer = producer.with_llm_call_logger(log_repo);
     println!("== produce mode={mode:?} output={output}");
     let processed = producer
         .run_repo_analysis(Path::new(repo), project_name)
@@ -1234,6 +1302,90 @@ fn inspect_command(check_type: &str, db_path: &str) -> Result<()> {
         }
         _ => {
             println!("{}", tr_global!("cli.inspect_unknown_check", check_type));
+        }
+    }
+    Ok(())
+}
+
+/// Phase 0.9: handler for `cleanroom-cli inspect llm-log`.
+///
+/// Three mutually-exclusive filters:
+/// - `--task-id <UUID>` — list every LLM call for a single task
+///   (oldest first)
+/// - `--recent N` — list the N most recent calls across all tasks
+///   (newest first)
+/// - (no flag) — same as `--recent 20` if neither is supplied
+///
+/// `--agent-type` further filters by `producer` / `consumer` / `meta`
+/// when set. `--format` switches between human-readable text (default)
+/// and newline-delimited JSON for piping into `jq`.
+fn llm_log_command(
+    task_id: Option<&str>,
+    recent: Option<usize>,
+    agent_type: Option<&str>,
+    format: &str,
+    db_path: &str,
+) -> Result<()> {
+    use cleanroom_db::LlmCallLogRepository;
+    let db = Database::open_with_migrations_from(
+        Path::new(db_path),
+        Some(&cli_migrations_dir()),
+    )?;
+    let repo = LlmCallLogRepository::new_with_arc(db.connection_arc());
+    let mut rows = if let Some(tid) = task_id {
+        repo.list_by_task(tid)?
+    } else {
+        let n = recent.unwrap_or(20);
+        repo.list_recent(n)?
+    };
+    if let Some(at) = agent_type {
+        rows.retain(|r| r.agent_type == at);
+    }
+    if rows.is_empty() {
+        println!("(no LLM call log entries match the filter)");
+        return Ok(());
+    }
+    let total_cost: f64 = rows.iter().map(|r| r.cost_estimate_usd).sum();
+    let total_prompt: u32 = rows.iter().map(|r| r.prompt_tokens).sum();
+    let total_completion: u32 = rows.iter().map(|r| r.completion_tokens).sum();
+    let total_duration_ms: u64 = rows.iter().map(|r| r.duration_ms).sum();
+    match format {
+        "json" => {
+            for r in &rows {
+                let json = serde_json::to_string(r).unwrap_or_default();
+                println!("{json}");
+            }
+        }
+        _ => {
+            for r in &rows {
+                println!("call_id: {}", r.call_id);
+                println!("  task_id:     {}", r.task_id.as_deref().unwrap_or("-"));
+                println!("  agent_type:  {}", r.agent_type);
+                println!("  app_name:    {}", r.app_name.as_deref().unwrap_or("-"));
+                println!("  model:       {}", r.model.as_deref().unwrap_or("-"));
+                println!("  status:      {}", r.status);
+                if let Some(err) = &r.error {
+                    println!("  error:       {err}");
+                }
+                println!(
+                    "  tokens:      {} prompt + {} completion",
+                    r.prompt_tokens, r.completion_tokens
+                );
+                println!("  duration_ms: {}", r.duration_ms);
+                println!("  iterations:  {}", r.iterations);
+                println!("  tool_calls:  {}", r.tool_calls);
+                println!("  cost_usd:    ${:.6}", r.cost_estimate_usd);
+                println!("  created_at:  {}", r.created_at);
+                println!();
+            }
+            println!(
+                "---- {} call(s) | {} prompt + {} completion tok | {} ms | ${:.6} total ----",
+                rows.len(),
+                total_prompt,
+                total_completion,
+                total_duration_ms,
+                total_cost
+            );
         }
     }
     Ok(())
