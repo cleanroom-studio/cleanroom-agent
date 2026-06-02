@@ -115,7 +115,11 @@ pub struct ParsedFunction {
 pub struct ParsedDesignDecision {
     #[serde(default)]
     pub topic: Option<String>,
-    pub decision: String,
+    // The LLM doesn't always emit a `decision` field (it often folds the
+    // decision into `description` / `rationale`). Tolerate absence and
+    // let the writer fall back to those fields (or `"unspecified"`).
+    #[serde(default)]
+    pub decision: Option<String>,
     #[serde(default)]
     pub rationale: Option<String>,
     #[serde(default)]
@@ -346,12 +350,22 @@ pub fn write_parsed_to_db(
             .clone()
             .or_else(|| dd.description.clone())
             .unwrap_or_default();
+        // `decision` is also NOT NULL in the schema. The LLM sometimes
+        // omits it, so fall back to the rationale / description / topic
+        // (or the literal `"unspecified"` if everything is empty).
+        let decision = dd
+            .decision
+            .clone()
+            .or_else(|| dd.description.clone())
+            .or_else(|| Some(rationale.clone()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unspecified".to_string());
         let id = format!("dd-{}", uuid::Uuid::new_v4());
         repo.create_design_decision(&DesignDecisionRecord {
             id,
             document_name: document_name.to_string(),
             topic,
-            decision: dd.decision.clone(),
+            decision,
             rationale,
             context: None,
             alternatives_json: None,
@@ -436,7 +450,39 @@ mod tests {
         assert_eq!(entities.functions[0].name, "validate_email");
         assert_eq!(entities.design_decisions.len(), 1);
         assert_eq!(entities.design_decisions[0].topic.as_deref(), Some("Storage"));
-        assert_eq!(entities.design_decisions[0].decision, "In-memory Vec");
+        assert_eq!(
+            entities.design_decisions[0].decision.as_deref(),
+            Some("In-memory Vec")
+        );
+    }
+
+    /// Bug 1 regression: the LLM often folds the decision into
+    /// `description` and omits the `decision` field. The parser must
+    /// accept that and the writer must fall back to a placeholder.
+    #[test]
+    fn parse_tolerates_design_decision_missing_decision_field() {
+        let raw = r#"```json
+{
+  "data_models": [],
+  "contracts": [],
+  "functions": [],
+  "design_decisions": [
+    {"topic": "Performance", "description": "We pre-allocate the result vector."}
+  ]
+}
+```"#;
+        let entities = parse_llm_analyze_output(raw).expect("parse");
+        assert_eq!(entities.design_decisions.len(), 1);
+        assert!(entities.design_decisions[0].decision.is_none());
+        // writer round-trip: the row must be persisted (count == 1)
+        // even though the LLM never supplied a `decision` value.
+        let repo = repo();
+        let summary = write_parsed_to_db(&repo, "bug1-proj", &entities).expect("write");
+        assert_eq!(summary.design_decisions, 1);
+        // Document row should also be created so the `export` command finds it.
+        let docs = repo.list_documents().expect("list documents");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].name, "bug1-proj");
     }
 
     #[test]

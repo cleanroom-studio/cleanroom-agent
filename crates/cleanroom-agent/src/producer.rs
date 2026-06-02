@@ -764,12 +764,50 @@ fn build_llm_analyze_file_system_prompt(document: &str, file_path: &str) -> Stri
          Project: {document}\n\
          File: {file_path}\n\
          \n\
+         Schema (every entity is an object; arrays hold zero or more entries; omit a whole \
+         section when no relevant entities exist):\n\
+         \n\
+         - `data_models[]`: {{ name: string (required), kind?: \"struct\"|\"enum\"|\"interface\"|\"legacy\", \
+            description?: string, visibility?: \"pub\"|\"private\", fields?: [ \
+            {{ name: string, type?: string, description?: string, visibility?: \"pub\"|\"private\" }} ] }}\n\
+         - `contracts[]`: {{ name: string (required), kind?: \"trait\"|\"interface\"|\"class\"|\"enum\"|\"api\", \
+            description?: string, visibility?: string, methods?: [ \
+            {{ name: string, signature?: string, description?: string }} ] }}\n\
+         - `functions[]`: {{ name: string (required), signature?: string, description?: string, \
+            logic?: string, visibility?: \"pub\"|\"private\" }}\n\
+         - `design_decisions[]`: {{ topic?: string, decision: string (required — concise summary \
+            of the choice, e.g. \"In-memory Vec\"; the writer will fall back to `description` or \
+            `rationale` if you omit it, but please include it explicitly), \
+            rationale?: string, description?: string }}\n\
+         \n\
          Rules:\n\
          - Emit only valid JSON. No prose outside the JSON fences.\n\
-         - Use the field names defined in S.DEF schema v0.1 exactly.\n\
+         - Use the field names above exactly. Required fields: `name` (data_models/contracts/functions) \
+            and `decision` (design_decisions).\n\
          - If a section has no relevant entities, omit it (don't emit empty arrays).\n\
          - For each entity, include a `description` field derived from the source.\n\
-         - When unsure, prefer omitting the entity over guessing its structure.\n"
+         - When unsure, prefer omitting the entity over guessing its structure.\n\
+         \n\
+         Example (illustrative; adapt to the actual source):\n\
+         ```json\n\
+         {{\n\
+           \"data_models\": [\n\
+             {{\"name\": \"User\", \"kind\": \"struct\", \"description\": \"User record.\", \"visibility\": \"pub\", \
+              \"fields\": [{{\"name\": \"id\", \"type\": \"u64\", \"description\": \"Unique id.\"}}]}}\n\
+           ],\n\
+           \"contracts\": [\n\
+             {{\"name\": \"UserStore\", \"kind\": \"trait\", \"description\": \"User storage contract.\", \
+              \"methods\": [{{\"name\": \"get\", \"signature\": \"fn get(&self, id: u64) -> Option<User>\"}}]}}\n\
+           ],\n\
+           \"functions\": [\n\
+             {{\"name\": \"validate_email\", \"signature\": \"fn validate_email(s: &str) -> bool\", \
+              \"description\": \"Email validation.\"}}\n\
+           ],\n\
+           \"design_decisions\": [\n\
+             {{\"topic\": \"Storage\", \"decision\": \"In-memory Vec\", \"rationale\": \"Simplicity.\"}}\n\
+           ]\n\
+         }}\n\
+         ```\n"
     )
 }
 

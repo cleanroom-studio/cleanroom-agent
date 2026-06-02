@@ -154,14 +154,24 @@ impl StagingWorkspace for TempDirBackend {
                     if let Some(parent) = dest.parent() {
                         fs::create_dir_all(parent)?;
                     }
+                    // Only record as written if the content actually changes
+                    // (or the file didn't exist). Avoids spurious entries when
+                    // the LLM writes the same content twice.
+                    let already_matches = dest.exists()
+                        && fs::read_to_string(&dest).map(|c| c == content).unwrap_or(false);
                     fs::write(&dest, content)?;
-                    report.files_written.push(path);
+                    if !already_matches {
+                        report.files_written.push(path);
+                    }
                 }
                 StagingOp::Delete => {
                     if dest.exists() {
                         fs::remove_file(&dest)?;
+                        report.files_deleted.push(path);
                     }
-                    report.files_deleted.push(path);
+                    // If the file didn't exist in the target, the delete
+                    // is a no-op and we don't record it. This also makes
+                    // write+delete of the same path produce an empty report.
                 }
             }
         }

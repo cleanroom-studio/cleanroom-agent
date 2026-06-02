@@ -1234,11 +1234,6 @@ fn produce_command(
 /// The directory layout at build / run time is:
 ///
 /// ```text
-/// $REPO/
-///   migrations/
-///     001_initial_schema.sql
-///     002_sdef_storage.sql
-///     ...
 ///   cleanroom-agent/
 ///     target/
 ///       debug/
@@ -1246,10 +1241,17 @@ fn produce_command(
 ///     crates/
 ///       cleanroom-cli/
 ///         src/
+///     migrations/                 <-- what we want
+///       001_initial_schema.sql
+///       002_sdef_storage.sql
+///       ...
 /// ```
 ///
-/// so we walk up **three** levels from the binary (debug/ → cleanroom-agent/)
-/// and then up another two to the repo root, where `migrations/` lives.
+/// so we walk up **three** levels from the binary (debug/ → target/ →
+/// cleanroom-agent/) and then join `migrations/`. The `migrations/`
+/// directory lives inside the `cleanroom-agent/` Cargo workspace
+/// (not the surrounding repo root — `cleanroom-agent` is its own
+/// workspace; see its root `Cargo.toml` `[workspace]` block).
 pub fn cli_migrations_dir() -> std::path::PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1258,18 +1260,15 @@ pub fn cli_migrations_dir() -> std::path::PathBuf {
             .map(|p| p.join("cleanroom-cli"))
             .unwrap_or_else(|| std::path::PathBuf::from("."))
     });
-    // exe is `.../target/<profile>/cleanroom-cli` (or `cleanroom-cli.exe`
-    // on Windows). Strip the binary name + the profile dir, then walk
-    // up two more levels to the repo root.
+    // exe is `cleanroom-agent/target/<profile>/cleanroom-cli`
+    // (or `cleanroom-cli.exe` on Windows). Walk up three levels to
+    // land on `cleanroom-agent/`, then join `migrations/`.
     let cleanroom_agent = exe
         .parent() // <profile>/
         .and_then(|p| p.parent()) // target/
         .and_then(|p| p.parent()) // cleanroom-agent/
         .unwrap_or_else(|| std::path::Path::new("."));
-    let repo_root = cleanroom_agent
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    repo_root.join("migrations")
+    cleanroom_agent.join("migrations")
 }
 
 /// Single-pass variant of the produce flow. Opens the DB, builds
@@ -1519,7 +1518,10 @@ fn resume_command(document: &str, retry_failed: bool, db_path: &str) -> Result<(
 /// - `coverage`: Entity counts across all tables
 /// - `progress`: Task status distribution
 fn inspect_command(check_type: &str, db_path: &str) -> Result<()> {
-    let db = match Database::open(Path::new(db_path)) {
+    let db = match Database::open_with_migrations_from(
+        Path::new(db_path),
+        Some(&cli_migrations_dir()),
+    ) {
         Ok(db) => db,
         Err(_) => {
             println!("{}", tr_global!("cli.inspect_no_db", db_path));
@@ -2066,7 +2068,10 @@ fn import_sdef_file(file: &str, db_path: &str) -> Result<String> {
             .context(tr_global!("cli.import_fail_parse_json"))?
     };
 
-    let _db = Database::open(Path::new(db_path))?;
+    let _db = Database::open_with_migrations_from(
+        Path::new(db_path),
+        Some(&cli_migrations_dir()),
+    )?;
     // Use the export_import importer for full data model + contract import
     let importer = cleanroom_db::export_import::SdefImporter::new(
         rusqlite::Connection::open(db_path)?,
@@ -2092,7 +2097,10 @@ fn import_command(file: &str, db_path: &str) -> Result<()> {
 fn migrate_command(direction: &str, db_path: &str) -> Result<()> {
     match direction {
         "up" => {
-            let _db = Database::open(Path::new(db_path))?;
+            let _db = Database::open_with_migrations_from(
+                Path::new(db_path),
+                Some(&cli_migrations_dir()),
+            )?;
             println!("{}", tr_global!("cli.migrate_success"));
         }
         "down" => {
@@ -2113,7 +2121,10 @@ fn upgrade_command(
     old_version: &str, new_version: &str, repo: &str,
     document: Option<&str>, apply: bool, db_path: &str,
 ) -> Result<()> {
-    let db = Arc::new(Database::open(Path::new(db_path))?);
+    let db = Arc::new(Database::open_with_migrations_from(
+        Path::new(db_path),
+        Some(&cli_migrations_dir()),
+    )?);
     let _doc_name = document.unwrap_or("default");
 
     println!("{}", tr_global!("cli.upgrade_running", old_version, new_version));
@@ -2169,8 +2180,11 @@ fn evaluate_command(
     use cleanroom_db::Database;
 
     let db = Arc::new(
-        Database::open(std::path::Path::new(db_path))
-            .context("Failed to open database")?,
+        Database::open_with_migrations_from(
+            std::path::Path::new(db_path),
+            Some(&cli_migrations_dir()),
+        )
+        .context("Failed to open database")?,
     );
 
     let output_dir = output

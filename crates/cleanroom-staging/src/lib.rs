@@ -19,11 +19,13 @@
 //! - `PLAN2.md` §5
 
 pub mod error;
+pub mod git_worktree;
 pub mod manifest;
 pub mod tempdir;
 pub mod workspace;
 
 pub use error::{StagingError, StagingResult};
+pub use git_worktree::GitWorktreeBackend;
 pub use manifest::{sha256_hex, StagingEntry, StagingOp};
 pub use tempdir::TempDirBackend;
 pub use workspace::{CommitReport, StagingMode, StagingWorkspace};
