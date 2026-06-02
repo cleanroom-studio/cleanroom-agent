@@ -30,6 +30,7 @@ use rusqlite::params;
 use serde_json;
 
 use cleanroom_db::{Database, DbError, Task, TaskRepository, TaskType, TypeCacheRepository};
+use cleanroom_meta_core::tool::MetaToolT;
 use cleanroom_meta_llm::MetaLlm;
 
 use crate::llm_loop::{run_loop, LoopConfig, LoopContext};
@@ -189,12 +190,23 @@ pub struct ConsumerAgent {
     llm: Option<Arc<dyn MetaLlm>>,
     /// Loop config for the LLM path.
     loop_config: LoopConfig,
+    /// Optional Phase 0.10 tool set, forwarded into every
+    /// `LoopConfig.tools` that `generate_code_with_llm` constructs.
+    /// `None` (the default) keeps the pre-0.10 single-shot behavior.
+    tools: Option<Vec<Arc<dyn MetaToolT>>>,
 }
 
 impl ConsumerAgent {
     pub fn new(config: ConsumerConfig, db: Arc<Database>) -> Self {
         let agent_id = format!("consumer-{}", uuid::Uuid::new_v4());
-        Self { config, db, agent_id, llm: None, loop_config: LoopConfig::default() }
+        Self {
+            config,
+            db,
+            agent_id,
+            llm: None,
+            loop_config: LoopConfig::default(),
+            tools: None,
+        }
     }
 
     /// Attach an LLM for the Phase 0.6 LLM-driven code generation path.
@@ -208,6 +220,17 @@ impl ConsumerAgent {
     /// Set the loop config for the LLM path.
     pub fn with_loop_config(mut self, cfg: LoopConfig) -> Self {
         self.loop_config = cfg;
+        self
+    }
+
+    /// Attach a tool set (Phase 0.10) to the per-call `LoopConfig.tools`
+    /// that `generate_code_with_llm` will pass to `run_loop`. An empty
+    /// vec (the default) is equivalent to the pre-0.10 no-tools
+    /// behavior. The supplied tools must be `Arc<dyn MetaToolT>` so
+    /// they can be cheaply cloned across `run_loop` invocations on
+    /// the same `ConsumerAgent`.
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn MetaToolT>>) -> Self {
+        self.tools = Some(tools);
         self
     }
 
@@ -349,7 +372,13 @@ impl ConsumerAgent {
                     user_message,
                 );
                 let started = std::time::Instant::now();
-                let outcome = run_loop(llm.clone(), ctx, &self.loop_config)
+                // Phase 0.10: forward the per-agent tool set into the
+                // per-call LoopConfig.tools. `None` (the default) yields
+                // an empty tool set via `unwrap_or_default()` in
+                // `run_loop_via_basic_agent` — i.e. pre-0.10 behavior.
+                let mut loop_cfg = self.loop_config.clone();
+                loop_cfg.tools = self.tools.clone();
+                let outcome = run_loop(llm.clone(), ctx, &loop_cfg)
                     .await
                     .map_err(|e| DbError::QueryFailed(format!("LLM call failed: {e}")))?;
                 let elapsed = started.elapsed().as_millis() as u64;
@@ -431,7 +460,10 @@ impl ConsumerAgent {
                     user_message,
                 );
                 let started = std::time::Instant::now();
-                let outcome = run_loop(llm.clone(), ctx, &self.loop_config)
+                // Phase 0.10: same as above (first run_loop call site).
+                let mut loop_cfg = self.loop_config.clone();
+                loop_cfg.tools = self.tools.clone();
+                let outcome = run_loop(llm.clone(), ctx, &loop_cfg)
                     .await
                     .map_err(|e| DbError::QueryFailed(format!("LLM call failed: {e}")))?;
                 let elapsed = started.elapsed().as_millis() as u64;

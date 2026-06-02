@@ -116,14 +116,14 @@ impl MetaAgentParser {
             tools,
             output: output_type,
         } = agent_attrs;
-        let tool_initializers = tools
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tool_expr| match tool_expr {
-                Expr::Path(expr_path) => quote! { #expr_path {} },
-                other => quote! { #other },
-            })
-            .collect::<Vec<_>>();
+        // Phase 0.10: tools are now stored as a `pub tools: Vec<Arc<dyn MetaToolT>>`
+        // field on the agent struct itself, so the generated `tools()` impl
+        // can read live tools at every call. The `tools = [...]` macro
+        // attribute is still accepted for backwards compat but ignored at
+        // codegen time. `DefaultLlmAgent` in `cleanroom-agent` is the
+        // canonical user of this field; new agents must declare
+        // `pub tools: Vec<Arc<dyn cleanroom_meta::core::tool::MetaToolT>>`.
+        let _ = tools;
 
         let quoted_output_type = match &output_type {
             Some(output_ty) => quote! { #output_ty },
@@ -164,11 +164,7 @@ impl MetaAgentParser {
                 }
 
                 fn tools(&self) -> Vec<Box<dyn cleanroom_meta::core::tool::MetaToolT>> {
-                    vec![
-                        #(
-                            Box::new(#tool_initializers) as Box<dyn cleanroom_meta::core::tool::MetaToolT>
-                        ),*
-                    ]
+                    cleanroom_meta::core::tool::shared_tools_to_boxes(&self.tools)
                 }
             }
 

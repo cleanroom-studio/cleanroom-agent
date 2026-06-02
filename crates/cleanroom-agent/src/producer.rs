@@ -45,6 +45,7 @@ use std::sync::Arc;
 use cleanroom_db::{
     Database, DbError, LlmCallLogRepository, Task, TaskRepository, TaskStatus, TaskType,
 };
+use cleanroom_meta_core::tool::MetaToolT;
 use cleanroom_meta_llm::MetaLlm;
 use tracing::{info, instrument, warn};
 
@@ -158,6 +159,11 @@ pub struct ProducerAgent {
     /// invocation will fire `LoopConfig::on_call_complete` to persist
     /// the call record to the `llm_call_log` table.
     llm_call_logger: Option<Arc<LlmCallLogRepository>>,
+    /// Optional Phase 0.10 tool set. Forwarded into every
+    /// `LoopConfig.tools` constructed inside `analyze_file_with_llm`.
+    /// `None` (the default) means no tools — equivalent to the
+    /// pre-0.10 single-shot path.
+    tools: Option<Vec<Arc<dyn MetaToolT>>>,
 }
 
 impl ProducerAgent {
@@ -171,6 +177,7 @@ impl ProducerAgent {
             llm: None,
             loop_config: LoopConfig::default(),
             llm_call_logger: None,
+            tools: None,
         }
     }
 
@@ -193,6 +200,17 @@ impl ProducerAgent {
     /// callback that writes a row to the `llm_call_log` table.
     pub fn with_llm_call_logger(mut self, logger: Arc<LlmCallLogRepository>) -> Self {
         self.llm_call_logger = Some(logger);
+        self
+    }
+
+    /// Attach a tool set (Phase 0.10) to the per-call `LoopConfig.tools`
+    /// that `analyze_file_with_llm` will pass to `run_loop`. An empty
+    /// vec (the default) is equivalent to the pre-0.10 no-tools
+    /// behavior. The supplied tools must be `Arc<dyn MetaToolT>` so
+    /// they can be cheaply cloned across `run_loop` invocations on
+    /// the same `ProducerAgent`.
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn MetaToolT>>) -> Self {
+        self.tools = Some(tools);
         self
     }
 
@@ -477,6 +495,12 @@ impl ProducerAgent {
         // `self.loop_config`. The hook (if `llm_call_logger` is set)
         // persists every LLM call to the `llm_call_log` table.
         let mut loop_cfg = self.loop_config.clone();
+        // Phase 0.10: forward `ProducerAgent.tools` into the per-call
+        // `LoopConfig.tools` so the framework's tool-aware code path
+        // is taken. `None` (the default) keeps the pre-0.10 behavior
+        // — `unwrap_or_default()` in `run_loop_via_basic_agent` yields
+        // an empty tool set, which the LLM then sees no tools for.
+        loop_cfg.tools = self.tools.clone();
         if let Some(logger) = self.llm_call_logger.clone() {
             loop_cfg.on_call_complete = Some(Arc::new(move |log: cleanroom_db::LlmCallLog| {
                 if let Err(e) = logger.create(&log) {

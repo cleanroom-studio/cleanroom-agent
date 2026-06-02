@@ -206,6 +206,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             tool_timeout_secs: 30,
             cost_limit_usd: Some(0.05),
             on_call_complete: None,
+            tools: None,
         });
     assert!(agent.has_llm(), "agent must have LLM attached for this demo");
 

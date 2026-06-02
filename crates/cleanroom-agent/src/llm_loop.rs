@@ -109,6 +109,14 @@ pub struct LoopConfig {
     /// `llm_call_log` table). The closure runs on the LLM-loop task;
     /// keep it fast and non-blocking.
     pub on_call_complete: Option<Arc<dyn Fn(LlmCallLog) + Send + Sync>>,
+    /// Phase 0.10: optional tool set. When `Some` and non-empty, the
+    /// loop constructs `DefaultLlmAgent { tools: ... }` and the LLM
+    /// can call them (per-turn when running through the ReAct
+    /// executor; single-turn when running through the basic
+    /// executor — basic only attaches the schema to the first chat
+    /// call). When `None` (default), the agent has no tools and the
+    /// pre-0.10 behavior is preserved exactly.
+    pub tools: Option<Vec<Arc<dyn cleanroom_meta_core::tool::MetaToolT>>>,
 }
 
 impl std::fmt::Debug for LoopConfig {
@@ -120,6 +128,7 @@ impl std::fmt::Debug for LoopConfig {
             .field("tool_timeout_secs", &self.tool_timeout_secs)
             .field("cost_limit_usd", &self.cost_limit_usd)
             .field("on_call_complete", &self.on_call_complete.as_ref().map(|_| "<fn>"))
+            .field("tools", &self.tools.as_ref().map(|v| format!("<{} tools>", v.len())))
             .finish()
     }
 }
@@ -133,6 +142,7 @@ impl Default for LoopConfig {
             tool_timeout_secs: 60,
             cost_limit_usd: None,
             on_call_complete: None,
+            tools: None,
         }
     }
 }
@@ -395,6 +405,16 @@ impl From<MetaBasicAgentOutput> for LoopAgentOutput {
 ///
 /// Users who want multi-iter ReAct / tool-calling can supply their own
 /// `#[agent]`-annotated struct instead of using this default.
+/// A no-op agent struct used by [`run_loop_via_basic_agent`] and the
+/// (forthcoming) `run_loop_via_react_agent`.
+///
+/// Phase 0.10: `tools` is a `Vec<Arc<dyn MetaToolT>>` field so the
+/// `#[meta_agent]` proc macro's generated `tools()` impl can read live
+/// tools at every call. An empty `Vec` (the default) is fine for
+/// single-shot, no-tool workflows — exactly the pre-0.10 behavior.
+///
+/// For multi-iter / ReAct / tool-calling, supply your own tools at
+/// construction time (or via `LoopConfig.tools`).
 #[meta_agent(
     name = "cleanroom_llm_agent",
     description = "A direct (single-iteration) LLM agent used by cleanroom-agent's llm_loop. \
@@ -402,7 +422,14 @@ impl From<MetaBasicAgentOutput> for LoopAgentOutput {
     output = LoopAgentOutput,
 )]
 #[derive(Default, Clone, MetaHooks)]
-pub struct DefaultLlmAgent {}
+pub struct DefaultLlmAgent {
+    /// Live tool set (Phase 0.10). The proc-macro-generated
+    /// `MetaDeriveT::tools()` reads this field via
+    /// `cleanroom_meta::core::tool::shared_tools_to_boxes(&self.tools)`
+    /// so callers can add / remove tools at any time before invoking
+    /// `MetaBasicAgent::new(DefaultLlmAgent { tools })`.
+    pub tools: Vec<Arc<dyn cleanroom_meta_core::tool::MetaToolT>>,
+}
 
 /// Run the LLM agent loop via `autoagents`'s `MetaBasicAgent` + `MetaDirectAgent`
 /// executor.
@@ -433,8 +460,14 @@ pub async fn run_loop_via_basic_agent(
     );
 
     // `MetaBasicAgent` owns the agent struct via the proc-macro-generated
-    // `MetaHooks` impl. Wrap our default no-op struct in it.
-    let basic = MetaBasicAgent::new(DefaultLlmAgent {});
+    // `MetaHooks` impl. Wrap our default no-op struct in it,
+    // threading the optional tool set from `LoopConfig` through the
+    // `tools` field (Phase 0.10). The generated `tools()` impl reads
+    // `self.tools` via `shared_tools_to_boxes`, so an empty Vec is
+    // equivalent to the pre-0.10 no-tools behavior.
+    let basic = MetaBasicAgent::new(DefaultLlmAgent {
+        tools: cfg.tools.clone().unwrap_or_default(),
+    });
 
     // Wrap the LLM in a UsageCapturingLlm so we can recover token counts
     // after `agent.run()` returns. `MetaBasicAgentOutput` only carries
@@ -1050,5 +1083,121 @@ mod on_call_complete_tests {
         let dbg = format!("{:?}", cfg);
         assert!(dbg.contains("on_call_complete"));
         assert!(dbg.contains("<fn>"));
+    }
+}
+
+// ============================================================================
+// Phase 0.10: `LoopConfig.tools` + `DefaultLlmAgent.tools` tests
+//
+// Locks down three properties of the new "tool set is opt-in" surface:
+//   1. `Default::default()` for `LoopConfig` is `tools: None` — i.e. the
+//      pre-0.10 single-shot, no-tool flow is unchanged.
+//   2. `Debug` for `LoopConfig` with `tools: Some(vec![...])` doesn't
+//      print the boxes (which are not Debug) — it shows just the count.
+//   3. `DefaultLlmAgent` is constructible with a non-empty `tools` vec
+//      of `Arc<dyn MetaToolT>`, and `Clone` shares the underlying Arc
+//      references (so `MetaBasicAgent::new(DefaultLlmAgent { tools })`
+//      and downstream clones see the same tool instances — important
+//      for the future per-ProducerAgent tool registry).
+// ============================================================================
+#[cfg(test)]
+mod function_call_tools_tests {
+    use super::*;
+    use crate::mcp_tool_bridge::{McpDispatchFn, McpToolBridge};
+    use cleanroom_meta_core::tool::MetaToolT;
+
+    fn echo_dispatch(args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(args)
+    }
+
+    fn make_arc_tool(name: &str) -> Arc<dyn MetaToolT> {
+        let bridge = McpToolBridge::new(
+            name,
+            format!("echo tool #{name}"),
+            serde_json::json!({"type": "object", "properties": {}}),
+            Arc::new(echo_dispatch) as McpDispatchFn,
+        );
+        Arc::new(bridge) as Arc<dyn MetaToolT>
+    }
+
+    #[test]
+    fn loop_config_default_has_tools_none() {
+        let cfg = LoopConfig::default();
+        assert!(cfg.tools.is_none(), "Phase 0.10 invariant: default has no tools");
+    }
+
+    #[test]
+    fn loop_config_with_tools_debug_does_not_panic_and_shows_count() {
+        // Pre-0.10: the same `LoopConfig` shape printed via `{:?}` worked
+        // because `tools` was an unprintable but `None` field. Now we have
+        // a real `Option<Vec<Box<...>>>` whose `Debug` impl (the derived
+        // one) would print the entire tool list — which fails because
+        // `dyn MetaToolT` is not `Debug`. The hand-rolled `Debug` for
+        // `LoopConfig` must therefore project tools to a count string.
+        let cfg = LoopConfig {
+            tools: Some(vec![make_arc_tool("alpha"), make_arc_tool("beta")]),
+            ..LoopConfig::default()
+        };
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("tools"));
+        assert!(dbg.contains("<2 tools>"), "got: {dbg}");
+    }
+
+    #[test]
+    fn loop_config_with_empty_tools_vec_still_constructs() {
+        // Distinguishing `None` (no-tools fast path, current default
+        // behavior) from `Some(vec![])` (explicitly opted in but with
+        // no tools) is intentional: the first is what the pre-0.10
+        // path serializes / deserializes as, the second is the
+        // forward-compatible "I want the tool-aware code path but
+        // I have no tools yet" form.
+        let cfg = LoopConfig {
+            tools: Some(vec![]),
+            ..LoopConfig::default()
+        };
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("<0 tools>"), "got: {dbg}");
+    }
+
+    #[test]
+    fn default_llm_agent_constructs_with_empty_tools() {
+        // The pre-0.10 path: `MetaBasicAgent::new(DefaultLlmAgent {})` —
+        // verified that the new struct still constructs with the
+        // default empty `tools` vec.
+        let agent = DefaultLlmAgent::default();
+        assert!(agent.tools.is_empty());
+    }
+
+    #[test]
+    fn default_llm_agent_constructs_with_nonempty_tools() {
+        let tools: Vec<Arc<dyn MetaToolT>> =
+            vec![make_arc_tool("echo"), make_arc_tool("ping")];
+        let agent = DefaultLlmAgent {
+            tools: tools.clone(),
+        };
+        assert_eq!(agent.tools.len(), 2);
+        assert_eq!(agent.tools[0].name(), "echo");
+        assert_eq!(agent.tools[1].name(), "ping");
+    }
+
+    #[test]
+    fn default_llm_agent_clone_shares_arc_tools() {
+        // `MetaBasicAgent` internally wraps `DefaultLlmAgent` in an Arc
+        // (see `cleanroom_meta_core::agent::base::MetaBaseAgent::inner`).
+        // Cloning the agent must not duplicate the tool Arc — both
+        // clones must point at the same `MetaToolT` instance, so any
+        // tool-side state mutated by the dispatch closure is visible
+        // across all clones. (Practically: this is a property of
+        // `Vec<Arc<T>>`'s `Clone`, but pinning it down here protects
+        // against a future maintainer accidentally using `Vec<Box<T>>`
+        // and breaking it.)
+        let tools: Vec<Arc<dyn MetaToolT>> = vec![make_arc_tool("shared")];
+        let a = DefaultLlmAgent {
+            tools: tools.clone(),
+        };
+        let b = a.clone();
+        assert_eq!(b.tools.len(), 1);
+        // Arc identity: same pointer.
+        assert!(Arc::ptr_eq(&a.tools[0], &b.tools[0]));
     }
 }
