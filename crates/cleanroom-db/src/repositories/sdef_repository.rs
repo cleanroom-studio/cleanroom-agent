@@ -2,7 +2,7 @@
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::instrument;
 
 use crate::error::{DbError, DbResult};
@@ -79,6 +79,26 @@ pub struct FunctionSpec {
     pub pure_function: bool,
 }
 
+/// Design-decision record — corresponds to a row in `design_decisions`.
+/// Used by the Phase 0.5 LLM writer path (`llm_sdef_parser`) to persist
+/// design rationales extracted from `LlmAnalyzeFile` output.
+///
+/// Note: `id` is `TEXT NOT NULL` (not autoincrement INTEGER), so the
+/// caller must always supply a stable id (the writer generates
+/// `dd-<uuid>` if absent). `rationale` is also `NOT NULL` in the schema,
+/// so the writer uses an empty string when the LLM omits it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesignDecisionRecord {
+    pub id: String,
+    pub document_name: String,
+    pub topic: String,
+    pub decision: String,
+    pub rationale: String,
+    pub context: Option<String>,
+    pub alternatives_json: Option<String>,
+    pub consequences_json: Option<String>,
+}
+
 /// UI Document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiDocument {
@@ -100,15 +120,24 @@ pub struct UiScreen {
 
 /// S.DEF repository.
 pub struct SdefRepository {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SdefRepository {
-    /// Create a new S.DEF repository.
+    /// Create a new S.DEF repository from an owned connection.
+    /// Wraps the connection in an `Arc<Mutex<...>>` so the same handle
+    /// can be shared across threads (Phase 0.5 LLM writer path needs this).
     pub fn new(conn: Connection) -> Self {
         Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         }
+    }
+
+    /// Create a new S.DEF repository from a shared `Arc<Mutex<Connection>>`.
+    /// Use this when you already have a `Database::connection_arc()` and
+    /// don't want to open a new connection just to write a few rows.
+    pub fn new_with_arc(conn: Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
     }
 
     // ============ Document Operations ============
@@ -519,6 +548,55 @@ impl SdefRepository {
             .collect();
 
         Ok(funcs)
+    }
+
+    /// Create a function spec (Phase 0.5 writer path).
+    /// Returns the new row id. `id` on the input is ignored.
+    #[instrument(skip_all)]
+    pub fn create_function_spec(&self, spec: &FunctionSpec) -> DbResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO function_specs (document_name, name, description, logic, complexity, pure_function)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+            params![
+                spec.document_name,
+                spec.name,
+                spec.description,
+                spec.logic,
+                spec.complexity,
+                spec.pure_function,
+            ],
+        )
+        .map_err(|e| DbError::QueryFailed(e.to_string()))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    // ============ Design Decision Operations ============
+
+    /// Create a design-decision row (Phase 0.5 writer path).
+    /// `id` and `rationale` are NOT NULL in the schema; caller must
+    /// supply both (the writer generates `dd-<uuid>` and an empty
+    /// rationale fallback).
+    #[instrument(skip_all)]
+    pub fn create_design_decision(&self, dd: &DesignDecisionRecord) -> DbResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO design_decisions
+               (id, document_name, topic, decision, rationale, context, alternatives_json, consequences_json)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            params![
+                dd.id,
+                dd.document_name,
+                dd.topic,
+                dd.decision,
+                dd.rationale,
+                dd.context,
+                dd.alternatives_json,
+                dd.consequences_json,
+            ],
+        )
+        .map_err(|e| DbError::QueryFailed(e.to_string()))?;
+        Ok(())
     }
 
     // ============ UI Screen Operations ============

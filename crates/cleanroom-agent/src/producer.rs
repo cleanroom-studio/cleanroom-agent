@@ -47,6 +47,7 @@ use cleanroom_meta_llm::MetaLlm;
 use tracing::{info, instrument, warn};
 
 use crate::llm_loop::{run_loop, LoopConfig, LoopContext, LoopOutcome};
+use crate::llm_sdef_parser::{parse_llm_analyze_output, write_parsed_to_db};
 use crate::producer_pipeline::{run_analysis_pipeline, run_analysis_pipeline_with_lsp};
 
 /// Producer execution mode — controls how `analyze_repo` processes a repository.
@@ -476,6 +477,59 @@ impl ProducerAgent {
                 completion_tokens,
                 ..
             } => {
+                // Phase 0.5 收尾: parse the LLM JSON into S.DEF entities
+                // and persist them. Failures are non-fatal: the raw
+                // output is still saved in `output_json` for replay.
+                let sdef_repo = cleanroom_db::SdefRepository::new_with_arc(
+                    self.db.connection_arc(),
+                );
+                let (parser_status, parse_summary) = match parse_llm_analyze_output(&result) {
+                    Ok(entities) => match write_parsed_to_db(&sdef_repo, document, &entities) {
+                        Ok(summary) => {
+                            info!(
+                                task_id = %task.task_id,
+                                file = %file_path,
+                                data_models = summary.data_models,
+                                attributes = summary.attributes,
+                                contracts = summary.contracts,
+                                functions = summary.functions,
+                                design_decisions = summary.design_decisions,
+                                "LlmAnalyzeFile: parsed + persisted S.DEF entities"
+                            );
+                            (
+                                "sdef-output/v0.1".to_string(),
+                                Some(serde_json::json!({
+                                    "data_models": summary.data_models,
+                                    "attributes": summary.attributes,
+                                    "contracts": summary.contracts,
+                                    "functions": summary.functions,
+                                    "design_decisions": summary.design_decisions,
+                                })),
+                            )
+                        }
+                        Err(e) => {
+                            warn!(
+                                task_id = %task.task_id,
+                                file = %file_path,
+                                error = %e,
+                                "LlmAnalyzeFile: parsed but DB write failed"
+                            );
+                            (
+                                format!("sdef-output/v0.1 (write failed: {e})"),
+                                None,
+                            )
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            task_id = %task.task_id,
+                            file = %file_path,
+                            error = %e,
+                            "LlmAnalyzeFile: LLM output could not be parsed"
+                        );
+                        (format!("sdef-output/v0.1 (parse failed: {e})"), None)
+                    }
+                };
                 let output = serde_json::json!({
                     "file_path": file_path,
                     "document": document,
@@ -483,7 +537,8 @@ impl ProducerAgent {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "schema_version": "sdef-output/draft",
-                    "parser": "pending (Phase 0.7)",
+                    "parser": parser_status,
+                    "parse_summary": parse_summary,
                 });
                 repo.complete(&task.task_id, &serde_json::to_string(&output).unwrap_or_default())?;
                 info!(

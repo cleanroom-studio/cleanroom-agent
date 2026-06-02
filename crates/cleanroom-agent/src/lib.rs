@@ -89,6 +89,12 @@ pub mod workflow_signal;
 pub mod auxiliary_hints;
 pub use auxiliary_hints::{FileHints, HintLine, compute_hints, compute_hints_for_file};
 
+// LLM-driven producer: parse `LlmAnalyzeFile` JSON into S.DEF entities
+// and persist them (Phase 0.5 收尾; replaces the `parser: "pending (Phase 0.7)"`
+// marker in `tasks.output_json`).
+pub mod llm_sdef_parser;
+pub use llm_sdef_parser::{parse_llm_analyze_output, write_parsed_to_db, ParsedEntities, WriteSummary};
+
 // LLM-driven producer: S.DEF context loader (Phase 0.3)
 pub mod sdef_context;
 pub use sdef_context::{

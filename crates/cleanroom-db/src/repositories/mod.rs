@@ -14,8 +14,8 @@ pub mod evaluation_repository;
 pub use task_repository::{Task, TaskRepository, TaskStatus, TaskType};
 pub use shard_repository::{Shard, ShardRepository, ShardStatus};
 pub use sdef_repository::{
-    Contract, DataAttribute, DataModel, FunctionSpec, SdefDocument, SdefRepository, UiDocument,
-    UiScreen,
+    Contract, DataAttribute, DataModel, DesignDecisionRecord, FunctionSpec, SdefDocument,
+    SdefRepository, UiDocument, UiScreen,
 };
 pub use symbol_repository::{ResolutionResult, SymbolEntry, SymbolRepository, SymbolType};
 pub use fingerprint_repository::{Fingerprint, FingerprintRepository};
