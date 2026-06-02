@@ -194,6 +194,19 @@ pub struct ConsumerAgent {
     /// `LoopConfig.tools` that `generate_code_with_llm` constructs.
     /// `None` (the default) keeps the pre-0.10 single-shot behavior.
     tools: Option<Vec<Arc<dyn MetaToolT>>>,
+    /// Phase 0.10: memory strategy (the "recipe" — what kind of
+    /// `MemoryProvider` to construct). Forwarded into every
+    /// `LoopConfig.memory` constructed inside `generate_code_with_llm`.
+    /// `MemoryConfig::default()` = `None` (pre-0.10 stateless).
+    memory_config: crate::llm_loop::MemoryConfig,
+    /// Phase 0.10: memory instance, cloned (cheaply via `Arc`) into
+    /// every `LoopContext.memory` constructed inside
+    /// `generate_code_with_llm`. When `None`, the loop runs
+    /// stateless even if `memory_config = SlidingWindow { .. }` —
+    /// the caller is expected to attach a memory instance via
+    /// [`ConsumerAgent::with_memory`] for the strategy to take
+    /// effect.
+    memory: Option<Arc<crate::llm_loop::LoopContextMemory>>,
 }
 
 impl ConsumerAgent {
@@ -206,6 +219,8 @@ impl ConsumerAgent {
             llm: None,
             loop_config: LoopConfig::default(),
             tools: None,
+            memory_config: crate::llm_loop::MemoryConfig::default(),
+            memory: None,
         }
     }
 
@@ -231,6 +246,36 @@ impl ConsumerAgent {
     /// the same `ConsumerAgent`.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn MetaToolT>>) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    /// Attach a memory strategy + instance (Phase 0.10). See
+    /// [`ProducerAgent::with_memory`] for full semantics — the
+    /// `ConsumerAgent` flow is identical (one memory per consume
+    /// run, shared across all data models / contracts / functions
+    /// that `generate_code_with_llm` walks).
+    pub fn with_memory(
+        mut self,
+        config: crate::llm_loop::MemoryConfig,
+        instance: crate::llm_loop::LoopContextMemory,
+    ) -> Self {
+        self.memory_config = config;
+        self.memory = Some(Arc::new(instance));
+        self
+    }
+
+    /// Convenience: build a `SlidingWindowMemory` instance from the
+    /// given window size and attach it together with the matching
+    /// `MemoryConfig` recipe. See [`ProducerAgent::with_memory_sliding_window`].
+    pub fn with_memory_sliding_window(
+        mut self,
+        window_size: usize,
+    ) -> Self {
+        use cleanroom_meta_core::agent::memory::SlidingWindowMemory;
+        self.memory_config = crate::llm_loop::MemoryConfig::SlidingWindow { window_size };
+        let sw = SlidingWindowMemory::new(window_size);
+        let provider: Box<dyn cleanroom_meta_core::agent::memory::MemoryProvider> = Box::new(sw);
+        self.memory = Some(Arc::new(tokio::sync::Mutex::new(provider)));
         self
     }
 
@@ -370,7 +415,8 @@ impl ConsumerAgent {
                     "cleanroom-consumer",
                     system_prompt,
                     user_message,
-                );
+                )
+                .with_memory_opt(self.memory.clone());
                 let started = std::time::Instant::now();
                 // Phase 0.10: forward the per-agent tool set into the
                 // per-call LoopConfig.tools. `None` (the default) yields
@@ -378,6 +424,7 @@ impl ConsumerAgent {
                 // `run_loop_via_basic_agent` — i.e. pre-0.10 behavior.
                 let mut loop_cfg = self.loop_config.clone();
                 loop_cfg.tools = self.tools.clone();
+                loop_cfg.memory = self.memory_config;
                 let outcome = run_loop(llm.clone(), ctx, &loop_cfg)
                     .await
                     .map_err(|e| DbError::QueryFailed(format!("LLM call failed: {e}")))?;
@@ -458,11 +505,13 @@ impl ConsumerAgent {
                     "cleanroom-consumer",
                     system_prompt,
                     user_message,
-                );
+                )
+                .with_memory_opt(self.memory.clone());
                 let started = std::time::Instant::now();
                 // Phase 0.10: same as above (first run_loop call site).
                 let mut loop_cfg = self.loop_config.clone();
                 loop_cfg.tools = self.tools.clone();
+                loop_cfg.memory = self.memory_config;
                 let outcome = run_loop(llm.clone(), ctx, &loop_cfg)
                     .await
                     .map_err(|e| DbError::QueryFailed(format!("LLM call failed: {e}")))?;

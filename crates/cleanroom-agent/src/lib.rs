@@ -126,8 +126,9 @@ pub use agent::{CleanroomAgent, AgentConfig, RunMode};
 // Phase 0.5 switched the basic-agent path to `cleanroom_meta_core::agent::MetaAgentBuilder`
 // + `MetaBasicAgent` for tool-calling support; the public API is kept stable.
 pub use llm_loop::{
-    run_loop, run_loop_via_basic_agent, DefaultLlmAgent, LoopAgentOutput, LoopConfig,
-    LoopContext, LoopError, LoopOutcome, LoopStats, UsageCapturingLlm, UsageCell,
+    build_system_prompt_with_skill, run_loop, run_loop_via_basic_agent, DefaultLlmAgent,
+    LoopAgentOutput, LoopConfig, LoopContext, LoopError, LoopOutcome, LoopStats,
+    UsageCapturingLlm, UsageCell,
 };
 pub mod mcp_tool_bridge;
 pub use mcp_tool_bridge::{McpToolBridge, McpToolSpec, mcp_tool_catalog};

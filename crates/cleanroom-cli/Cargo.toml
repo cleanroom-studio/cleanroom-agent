@@ -9,6 +9,8 @@ cleanroom-agent = { path = "../cleanroom-agent" }
 cleanroom-db = { path = "../cleanroom-db" }
 cleanroom-mcp = { path = "../cleanroom-mcp" }
 cleanroom-i18n = { path = "../cleanroom-i18n" }
+cleanroom-skill = { path = "../cleanroom-skill" }
+cleanroom-staging = { path = "../cleanroom-staging" }
 sdef-core = { path = "../sdef-core" }
 # Phase 0.8: CLI builds the LLM directly from env vars (build_llm_from_env)
 cleanroom-meta-llm.workspace = true

@@ -187,6 +187,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         cost_limit_usd: Some(0.05),
         on_call_complete: None,
         tools: None,
+        memory: cleanroom_agent::llm_loop::MemoryConfig::None,
     };
 
     println!("== run_loop_via_basic_agent start ==");

@@ -8,6 +8,7 @@ license.workspace = true
 cleanroom-db = { path = "../cleanroom-db" }
 cleanroom-lsp = { path = "../cleanroom-lsp" }
 cleanroom-prompt = { path = "../cleanroom-prompt" }
+cleanroom-skill = { path = "../cleanroom-skill" }
 sdef-core = { path = "../sdef-core" }
 # LLM agent framework — vendored autoagents fork (cleanroom-meta-*). All 5
 # crates are in the workspace; we depend on them by path here. The `cleanroom-meta`

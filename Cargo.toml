@@ -22,6 +22,10 @@ members = [
     # plus `async_trait` so `#[derive(MetaHooks)]` / `#[meta_agent]` can write
     # `::cleanroom_meta::*` paths.
     "crates/cleanroom-meta",
+    # PLAN2 Phase A: Skills / Replication Protocol engine
+    "crates/cleanroom-skill",
+    # PLAN2 Phase D: Staging 隔离工作区抽象
+    "crates/cleanroom-staging",
 ]
 
 [workspace.dependencies]

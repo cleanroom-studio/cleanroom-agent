@@ -164,6 +164,19 @@ pub struct ProducerAgent {
     /// `None` (the default) means no tools — equivalent to the
     /// pre-0.10 single-shot path.
     tools: Option<Vec<Arc<dyn MetaToolT>>>,
+    /// Phase 0.10: memory strategy (the "recipe" — what kind of
+    /// `MemoryProvider` to construct). Forwarded into every
+    /// `LoopConfig.memory` constructed inside `analyze_file_with_llm`.
+    /// `MemoryConfig::default()` = `None` (pre-0.10 stateless).
+    memory_config: crate::llm_loop::MemoryConfig,
+    /// Phase 0.10: memory instance, cloned (cheaply via `Arc`) into
+    /// every `LoopContext.memory` constructed inside
+    /// `analyze_file_with_llm`. When `None`, the loop runs
+    /// stateless even if `memory_config = SlidingWindow { .. }` —
+    /// the caller is expected to attach a memory instance via
+    /// [`ProducerAgent::with_memory`] for the strategy to take
+    /// effect.
+    memory: Option<Arc<crate::llm_loop::LoopContextMemory>>,
 }
 
 impl ProducerAgent {
@@ -178,6 +191,8 @@ impl ProducerAgent {
             loop_config: LoopConfig::default(),
             llm_call_logger: None,
             tools: None,
+            memory_config: crate::llm_loop::MemoryConfig::default(),
+            memory: None,
         }
     }
 
@@ -211,6 +226,39 @@ impl ProducerAgent {
     /// the same `ProducerAgent`.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn MetaToolT>>) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    /// Attach a memory strategy + instance (Phase 0.10).
+    ///
+    /// `config` selects what kind of `MemoryProvider` is expected
+    /// (`None` or `SlidingWindow { window_size }`); the `instance`
+    /// is the actual storage. For convenience, `with_memory_kind`
+    /// (below) constructs the instance for you from the kind —
+    /// call that unless you've already constructed a
+    /// `MemoryProvider` from somewhere else (e.g. a test fixture).
+    pub fn with_memory(
+        mut self,
+        config: crate::llm_loop::MemoryConfig,
+        instance: crate::llm_loop::LoopContextMemory,
+    ) -> Self {
+        self.memory_config = config;
+        self.memory = Some(Arc::new(instance));
+        self
+    }
+
+    /// Convenience: build a `SlidingWindowMemory` instance from the
+    /// given window size and attach it together with the matching
+    /// `MemoryConfig` recipe.
+    pub fn with_memory_sliding_window(
+        mut self,
+        window_size: usize,
+    ) -> Self {
+        use cleanroom_meta_core::agent::memory::SlidingWindowMemory;
+        self.memory_config = crate::llm_loop::MemoryConfig::SlidingWindow { window_size };
+        let sw = SlidingWindowMemory::new(window_size);
+        let provider: Box<dyn cleanroom_meta_core::agent::memory::MemoryProvider> = Box::new(sw);
+        self.memory = Some(Arc::new(tokio::sync::Mutex::new(provider)));
         self
     }
 
@@ -501,6 +549,12 @@ impl ProducerAgent {
         // — `unwrap_or_default()` in `run_loop_via_basic_agent` yields
         // an empty tool set, which the LLM then sees no tools for.
         loop_cfg.tools = self.tools.clone();
+        // Phase 0.10: forward `memory_config` (the recipe) into
+        // `loop_cfg.memory` so the loop can pick the right `recall`
+        // limit. The actual memory instance lives on
+        // `ProducerAgent.memory` and is wired into the `LoopContext`
+        // below.
+        loop_cfg.memory = self.memory_config;
         if let Some(logger) = self.llm_call_logger.clone() {
             loop_cfg.on_call_complete = Some(Arc::new(move |log: cleanroom_db::LlmCallLog| {
                 if let Err(e) = logger.create(&log) {
@@ -525,7 +579,12 @@ impl ProducerAgent {
             system_prompt,
             user_message,
         )
-        .with_model(model_name);
+        .with_model(model_name)
+        // Phase 0.10: attach the shared memory instance (if any) so
+        // the loop can splice history into the LLM call and persist
+        // this turn afterwards. `Arc::clone` is cheap — every call
+        // on the same `ProducerAgent` shares the same `SlidingWindowMemory`.
+        .with_memory_opt(self.memory.clone());
         let outcome = run_loop(llm.clone(), ctx, &loop_cfg)
             .await
             .map_err(|e| DbError::QueryFailed(format!("LLM call failed: {e}")))?;

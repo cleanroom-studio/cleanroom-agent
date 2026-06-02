@@ -55,13 +55,15 @@
 //! # }
 //! ```
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Instant;
 
 use cleanroom_db::LlmCallLog;
+use cleanroom_meta_core::agent::memory::{MemoryProvider, SlidingWindowMemory};
 use cleanroom_meta_core::agent::prebuilt::executor::{MetaBasicAgent, MetaBasicAgentOutput};
 use cleanroom_meta_core::agent::task::MetaTask;
 use cleanroom_meta_core::agent::{MetaAgentBuilder, MetaOutputT, MetaDirectAgent};
+use tokio::sync::Mutex;
 use cleanroom_meta_llm::chat::{
     MetaMessage, MetaMessageBuilder, MetaProvider, MetaResponse, MetaRole, Tool, Usage,
     MetaStructuredOutputFormat,
@@ -79,6 +81,52 @@ use tracing::{info, warn};
 // ============================================================================
 // Public types
 // ============================================================================
+
+/// Phase 0.10: memory strategy for one `run_loop` invocation.
+///
+/// Selects how the loop maintains multi-turn context across calls.
+/// `Default = MemoryConfig::None` keeps the pre-0.10 stateless
+/// behavior; opt in by setting this on a `LoopConfig` and providing
+/// a matching `Arc<Mutex<Box<dyn MemoryProvider>>>` on
+/// [`LoopContext::with_memory`].
+///
+/// Note: the **actual** memory instance lives on `LoopContext`, not
+/// on `LoopConfig` — `LoopConfig.memory` is just the *recipe* that
+/// tells the surrounding agent (`ProducerAgent` / `ConsumerAgent`)
+/// what kind of instance to construct. This split lets `LoopConfig`
+/// stay `Clone + Send + Sync` (the enum is `Clone + Send + Sync`)
+/// while the memory instance — which holds a `Mutex` — lives
+/// separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryConfig {
+    /// Stateless, no memory across calls. The pre-0.10 default.
+    None,
+    /// Sliding window: keep the last `window_size` messages; drop
+    /// older ones on overflow (or mark for summarization, see
+    /// `SlidingWindowMemory::with_strategy`).
+    SlidingWindow {
+        /// Maximum number of messages to retain (excluding the
+        /// prepended history slots used in the next call).
+        window_size: usize,
+    },
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl std::fmt::Display for MemoryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::SlidingWindow { window_size } => {
+                write!(f, "sliding_window({window_size})")
+            }
+        }
+    }
+}
 
 /// Tuning parameters + cost guardrail for one `run_loop` invocation.
 #[derive(Clone)]
@@ -117,6 +165,14 @@ pub struct LoopConfig {
     /// call). When `None` (default), the agent has no tools and the
     /// pre-0.10 behavior is preserved exactly.
     pub tools: Option<Vec<Arc<dyn cleanroom_meta_core::tool::MetaToolT>>>,
+    /// Phase 0.10: memory strategy (recipe only — the actual
+    /// `MemoryProvider` instance lives on `LoopContext.memory`).
+    /// `Default = MemoryConfig::None` keeps the pre-0.10 stateless
+    /// behavior; opt in via `MemoryConfig::SlidingWindow { .. }` and
+    /// pair with `LoopContext::with_memory(arc)` (or the matching
+    /// `ProducerAgent::with_memory` / `ConsumerAgent::with_memory`
+    /// builders which thread the same value through).
+    pub memory: MemoryConfig,
 }
 
 impl std::fmt::Debug for LoopConfig {
@@ -129,6 +185,7 @@ impl std::fmt::Debug for LoopConfig {
             .field("cost_limit_usd", &self.cost_limit_usd)
             .field("on_call_complete", &self.on_call_complete.as_ref().map(|_| "<fn>"))
             .field("tools", &self.tools.as_ref().map(|v| format!("<{} tools>", v.len())))
+            .field("memory", &self.memory)
             .finish()
     }
 }
@@ -143,6 +200,7 @@ impl Default for LoopConfig {
             cost_limit_usd: None,
             on_call_complete: None,
             tools: None,
+            memory: MemoryConfig::None,
         }
     }
 }
@@ -168,8 +226,24 @@ pub struct LoopContext {
     /// [`LoopContext::with_model`]; defaults to `None` for backwards
     /// compatibility with the 5-arg `new()` constructor.
     pub model: Option<String>,
+    /// Phase 0.10: optional memory instance. When `Some`, the loop
+    /// queries `recall()` before the LLM call to prepend history
+    /// to the message vector, and calls `remember(user)` then
+    /// `remember(assistant)` after the LLM call. The instance is
+    /// typically owned by the surrounding `ProducerAgent` /
+    /// `ConsumerAgent` (so it persists across `run_loop` calls on
+    /// the same agent), but `LoopContext` clones the `Arc` cheaply.
+    ///
+    /// We use `tokio::sync::Mutex` (not `std::sync::Mutex`) because
+    /// the lock is held across `MemoryProvider::recall().await` /
+    /// `remember().await`, and `std::sync::MutexGuard` is `!Send`
+    /// which breaks `tokio::spawn` callers (e.g. `orchestrator.rs`
+    /// `ProducerAgent::process_next_task` is spawned across a
+    /// multi-producer pool). The async mutex locks via `.await`
+    /// so its guard is also `Send`.
+    pub memory: Option<Arc<Mutex<Box<dyn MemoryProvider>>>>,
     /// Internal handle to the live stats accumulator.
-    stats: Arc<Mutex<LoopStats>>,
+    stats: Arc<StdMutex<LoopStats>>,
 }
 
 impl LoopContext {
@@ -188,7 +262,8 @@ impl LoopContext {
             system_prompt: system_prompt.into(),
             initial_user_message: initial_user_message.into(),
             model: None,
-            stats: Arc::new(Mutex::new(LoopStats::default())),
+            memory: None,
+            stats: Arc::new(StdMutex::new(LoopStats::default())),
         }
     }
 
@@ -199,12 +274,43 @@ impl LoopContext {
         self
     }
 
+    /// Builder-style: attach a memory instance (Phase 0.10). The
+    /// instance is shared via `Arc` so the same memory can be
+    /// threaded across many `run_loop` calls.
+    pub fn with_memory(
+        mut self,
+        memory: Arc<Mutex<Box<dyn MemoryProvider>>>,
+    ) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// Builder-style: attach a memory instance, taking `Option` so
+    /// callers (`ProducerAgent` / `ConsumerAgent`) can forward their
+    /// own `Option<Arc<...>>` field directly without an `.map(...)`.
+    /// Equivalent to `self.memory = memory;` if `memory.is_some()`,
+    /// else leaves `self.memory = None`.
+    pub fn with_memory_opt(
+        mut self,
+        memory: Option<Arc<Mutex<Box<dyn MemoryProvider>>>>,
+    ) -> Self {
+        self.memory = memory;
+        self
+    }
+
     /// Borrow the internal stats handle; callers can `lock().snapshot()` to
     /// read the live state.
-    pub fn stats_handle(&self) -> Arc<Mutex<LoopStats>> {
+    pub fn stats_handle(&self) -> Arc<StdMutex<LoopStats>> {
         self.stats.clone()
     }
 }
+
+/// Phase 0.10: the type alias `LoopContextMemory` is the lock type
+/// used by both `LoopContext::memory` and the matching agent-level
+/// memory slots (`ProducerAgent::memory` / `ConsumerAgent::memory`).
+/// Re-exported here so callers don't have to import the
+/// `tokio::sync::Mutex` path themselves.
+pub type LoopContextMemory = Mutex<Box<dyn MemoryProvider>>;
 
 /// Final outcome of a `run_loop` invocation.
 ///
@@ -262,6 +368,12 @@ pub struct LoopStats {
     pub completion_tokens: u32,
     pub elapsed_ms: u64,
     pub cost_estimate_usd: f64,
+    /// Phase 0.10: how many history messages were prepended to
+    /// the LLM call (from `MemoryProvider::recall`). `0` means
+    /// no memory was attached or the memory was empty. Surfaced
+    /// to `LlmCallLog::memory_messages_at_call` via
+    /// `fire_on_call_complete`.
+    pub memory_messages_at_call: i64,
 }
 
 // ============================================================================
@@ -290,8 +402,10 @@ pub async fn run_loop(
         "llm_loop::run_loop start"
     );
 
-    // 1. Build the two-message seed: system + user.
-    let messages = vec![
+    // 1. Build the two-message seed: system + user. Phase 0.10
+    // prepends memory history (if any) ahead of the system message
+    // so the LLM sees prior turns of the same conversation.
+    let mut messages = vec![
         MetaMessageBuilder::new(MetaRole::System)
             .content(ctx.system_prompt.clone())
             .build(),
@@ -299,6 +413,46 @@ pub async fn run_loop(
             .content(ctx.initial_user_message.clone())
             .build(),
     ];
+    // Phase 0.10: query memory (if attached) and prepend history.
+    // We use the `window_size` hint from `cfg.memory` to bound how
+    // much history to splice in; falls back to the memory's own
+    // internal window when `cfg.memory = None` (e.g. caller is
+    // using a pre-configured `SlidingWindowMemory` with its own
+    // window_size and passed it via `with_memory`).
+    // Phase 0.10: query memory (if attached) and prepend history.
+    // `tokio::sync::Mutex::lock().await` returns a guard that is
+    // `Send` across `.await`, which `orchestrator.rs`'s
+    // `tokio::spawn(async move { ... })` requires. Note that
+    // tokio's lock does NOT return a `Result` (it panics on
+    // poisoned mutex via `blocking_lock` instead, but the async
+    // lock path can't observe poisoning), so no `match Ok/Err` is
+    // needed here.
+    let history: Vec<MetaMessage> = if let Some(mem_arc) = &ctx.memory {
+        let limit = match cfg.memory {
+            MemoryConfig::None => None,
+            MemoryConfig::SlidingWindow { window_size } => Some(window_size),
+        };
+        let mut guard = mem_arc.lock().await;
+        match guard.recall("", limit).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    task_id = %ctx.task_id,
+                    error = %e,
+                    "run_loop: memory recall failed; proceeding without history"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let memory_prepend_count: i64 = history.len() as i64;
+    if memory_prepend_count > 0 {
+        let mut with_history = history;
+        with_history.append(&mut messages);
+        messages = with_history;
+    }
 
     // 2. Single LLM call.
     let response = llm
@@ -306,7 +460,9 @@ pub async fn run_loop(
         .await
         .map_err(|e| LoopError::LlmCall(e.to_string()))?;
 
-    // 3. Accumulate stats from the response.
+    // 3. Accumulate stats from the response. Phase 0.10 also
+    // records `memory_messages_at_call` so observers can see how
+    // many history messages the LLM was fed on this call.
     {
         let mut s = lock_stats(&stats);
         s.iterations = 1;
@@ -321,8 +477,39 @@ pub async fn run_loop(
         }
         s.elapsed_ms = started.elapsed().as_millis() as u64;
         s.cost_estimate_usd = estimate_cost(s.prompt_tokens, s.completion_tokens);
+        s.memory_messages_at_call = memory_prepend_count;
     }
     let snapshot = lock_stats(&stats).clone();
+
+    // Phase 0.10: remember this turn. We do this BEFORE firing
+    // `on_call_complete` so observers reading the audit log can
+    // correlate the LLM call with the memory write that follows.
+    if let Some(mem_arc) = &ctx.memory {
+        let text = response.text().unwrap_or_default();
+        let user_msg = MetaMessageBuilder::new(MetaRole::User)
+            .content(ctx.initial_user_message.clone())
+            .build();
+        let assistant_msg = MetaMessageBuilder::new(MetaRole::Assistant)
+            .content(text.clone())
+            .build();
+        // `tokio::sync::Mutex::lock().await` — same reasoning as
+        // above (Send across await, no Result on lock).
+        let mut guard = mem_arc.lock().await;
+        if let Err(e) = guard.remember(&user_msg).await {
+            warn!(
+                task_id = %ctx.task_id,
+                error = %e,
+                "run_loop: memory remember(user) failed"
+            );
+        }
+        if let Err(e) = guard.remember(&assistant_msg).await {
+            warn!(
+                task_id = %ctx.task_id,
+                error = %e,
+                "run_loop: memory remember(assistant) failed"
+            );
+        }
+    }
 
     // Phase 0.9: fire the on_call_complete hook (if attached) with a
     // `completed` record. We do this even though the outcome may later
@@ -444,6 +631,79 @@ pub struct DefaultLlmAgent {
 /// the conversation *history* lives entirely inside the agent's `MetaTask`
 /// (single-turn for now, because `MetaDirectAgent` runs exactly one LLM call
 /// per task).
+///
+/// **Phase 0.10 memory note**: this function does NOT support
+/// `LoopContext::memory`. The `MetaDirectAgent` executor is single-turn
+/// (it concatenates system + user into one `MetaTask` string) and there
+/// is no clean way to splice prepended history into that pipeline
+/// without re-architecting the agent framework. Use [`run_loop`]
+/// directly if you need memory — it's the canonical Phase 0.10 path
+/// for stateful conversations. (`run_loop_via_basic_agent` will
+/// pick up memory in Phase 0.10.4 once the ReAct executor path is
+/// in place — at that point `MetaAgentBuilder::memory()` will own
+/// the lifecycle.)
+
+// ============================================================================
+// PLAN2 Phase F.3: Skill injection helpers
+//
+// `run_loop`'s signature is intentionally frozen for backward compat.
+// Skill injection happens in two flavors:
+//
+// 1. `build_system_prompt_with_skill(...)` — pure function: takes the
+//    caller's `system_prompt`, an `Option<&SkillIndex>`, and an
+//    `Option<&SelectionPolicy>`, and returns a *new* system prompt
+//    string with Tier 1 (`<available_skills>`) + Tier 2 (preselected
+//    body) blocks appended. Callers fold the result into their
+//    `LoopContext.system_prompt` before calling `run_loop`.
+//
+// 2. The `mcp_tool_bridge.rs` path uses the same helper internally to
+//    keep `ProducerAgent` / `ConsumerAgent` from hard-coding skill
+//    logic.
+// ============================================================================
+
+use cleanroom_skill::{
+    build_skill_catalog_block, select_skill_prompt_block, SelectionPolicy, SkillIndex,
+};
+
+/// Build a system prompt that has the Tier 1 `<available_skills>` block
+/// and (optionally) the Tier 2 preselected body of the top-1 match for
+/// `query`. Pure function — no I/O, no state.
+pub fn build_system_prompt_with_skill(
+    base_prompt: &str,
+    skill_index: Option<&SkillIndex>,
+    query: Option<&str>,
+    policy: Option<&SelectionPolicy>,
+    task_type: Option<&str>,
+    token_budget_chars: usize,
+) -> String {
+    let Some(index) = skill_index else {
+        return base_prompt.to_string();
+    };
+    if index.is_empty() {
+        return base_prompt.to_string();
+    }
+
+    let catalog = build_skill_catalog_block(index, task_type);
+
+    let tier2 = match (query, policy) {
+        (Some(q), Some(p)) => select_skill_prompt_block(index, q, p, token_budget_chars)
+            .map(|(block, _)| block)
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+
+    let mut out = String::with_capacity(base_prompt.len() + catalog.len() + tier2.len() + 32);
+    out.push_str(base_prompt);
+    out.push_str("\n\n");
+    out.push_str(&catalog);
+    if !tier2.is_empty() {
+        out.push_str("\n\n[preloaded]\n");
+        out.push_str(&tier2);
+        out.push_str("\n[/preloaded]");
+    }
+    out
+}
+
 pub async fn run_loop_via_basic_agent(
     llm: Arc<dyn MetaLlm>,
     ctx: LoopContext,
@@ -473,7 +733,7 @@ pub async fn run_loop_via_basic_agent(
     // after `agent.run()` returns. `MetaBasicAgentOutput` only carries
     // `response: String` + `done: bool`, so without this proxy the cost
     // guardrail in `LoopConfig::cost_limit_usd` is meaningless.
-    let cell: UsageCell = Arc::new(Mutex::new(None));
+    let cell: UsageCell = Arc::new(StdMutex::new(None));
     let capturing = UsageCapturingLlm::new(llm, cell.clone());
     let llm_dyn: Arc<dyn MetaLlm> = Arc::new(capturing);
 
@@ -578,7 +838,7 @@ pub async fn run_loop_via_basic_agent(
 // ============================================================================
 
 /// Thread-safe shared cell for the last observed LLM usage.
-pub type UsageCell = Arc<Mutex<Option<Usage>>>;
+pub type UsageCell = Arc<StdMutex<Option<Usage>>>;
 
 /// LLM proxy that records the last `Usage` (prompt + completion tokens) from
 /// every `MetaProvider::chat_with_tools` call into a shared `UsageCell`.
@@ -709,7 +969,7 @@ impl MetaLlm for UsageCapturingLlm {}
 // Helpers
 // ============================================================================
 
-fn lock_stats(stats: &Arc<Mutex<LoopStats>>) -> MutexGuard<'_, LoopStats> {
+fn lock_stats(stats: &Arc<StdMutex<LoopStats>>) -> MutexGuard<'_, LoopStats> {
     // Lock poisoning would be unrecoverable here; just propagate.
     stats.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -758,6 +1018,7 @@ fn fire_on_call_complete(
         iterations: snapshot.iterations,
         tool_calls: snapshot.tool_calls,
         cost_estimate_usd: snapshot.cost_estimate_usd,
+        memory_messages_at_call: snapshot.memory_messages_at_call,
         status: status.to_string(),
         error,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -894,13 +1155,13 @@ mod usage_capturing_tests {
 
     #[test]
     fn test_usage_cell_default_is_none() {
-        let cell: UsageCell = Arc::new(Mutex::new(None));
+        let cell: UsageCell = Arc::new(StdMutex::new(None));
         assert!(cell.lock().unwrap().is_none());
     }
 
     #[test]
     fn test_usage_cell_write_then_read() {
-        let cell: UsageCell = Arc::new(Mutex::new(None));
+        let cell: UsageCell = Arc::new(StdMutex::new(None));
         *cell.lock().unwrap() = Some(Usage {
             prompt_tokens: 42,
             completion_tokens: 7,
@@ -977,6 +1238,7 @@ mod on_call_complete_tests {
             completion_tokens: 1024,
             elapsed_ms: 29_400,
             cost_estimate_usd: 0.0169,
+            memory_messages_at_call: 0,
         }
     }
 
@@ -1199,5 +1461,186 @@ mod function_call_tools_tests {
         assert_eq!(b.tools.len(), 1);
         // Arc identity: same pointer.
         assert!(Arc::ptr_eq(&a.tools[0], &b.tools[0]));
+    }
+}
+
+// ============================================================================
+// Phase 0.10: `MemoryConfig` + `LoopContext::with_memory_opt` tests
+//
+// Validates the wiring surface for the new memory subsystem. End-to-end
+// behavior (prepend / append) is exercised by the integration / 0.10.4
+// end-to-end path; these tests pin down:
+//   1. `MemoryConfig::default()` is `None` — the pre-0.10 stateless
+//      behavior.
+//   2. `Display` for both variants.
+//   3. `LoopConfig` round-trips the new `memory` field through Debug.
+//   4. `LoopContext::with_memory_opt` forwards the `Some` / `None` arm.
+//   5. `LoopStats::memory_messages_at_call` is part of the public surface
+//      and defaults to 0 (so legacy audit hooks don't need a rewrite).
+// ============================================================================
+#[cfg(test)]
+mod memory_config_tests {
+    use super::*;
+
+    #[test]
+    fn memory_config_default_is_none() {
+        let cfg = MemoryConfig::default();
+        assert!(matches!(cfg, MemoryConfig::None));
+    }
+
+    #[test]
+    fn memory_config_display_renders_both_variants() {
+        assert_eq!(MemoryConfig::None.to_string(), "none");
+        assert_eq!(
+            MemoryConfig::SlidingWindow { window_size: 8 }.to_string(),
+            "sliding_window(8)"
+        );
+    }
+
+    #[test]
+    fn loop_config_default_has_memory_none() {
+        let cfg = LoopConfig::default();
+        assert!(matches!(cfg.memory, MemoryConfig::None));
+    }
+
+    #[test]
+    fn loop_config_debug_includes_memory_field() {
+        // Pre-0.10: `Debug` for `LoopConfig` only had a hand-rolled
+        // subset. We must extend it to print the new `memory` field
+        // or it would be silently dropped from `format!("{:?}", cfg)`.
+        let cfg = LoopConfig {
+            memory: MemoryConfig::SlidingWindow { window_size: 16 },
+            ..LoopConfig::default()
+        };
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.contains("memory"), "got: {dbg}");
+        // The Debug derive on `MemoryConfig` prints the struct
+        // variant, not the `Display` impl, so we look for
+        // `SlidingWindow { window_size: 16 }` rather than
+        // `sliding_window(16)`.
+        assert!(dbg.contains("SlidingWindow"), "got: {dbg}");
+        assert!(dbg.contains("window_size: 16"), "got: {dbg}");
+    }
+
+    #[test]
+    fn loop_context_with_memory_opt_some_round_trips() {
+        // Building a concrete `MemoryProvider` for the test is overkill;
+        // the trait object round-trip is verified at the type level by
+        // checking the field is `Some` after `with_memory_opt(Some(..))`.
+        // We use a fresh `SlidingWindowMemory` instance (kept alive
+        // via `Arc`) so the field value is observable.
+        use cleanroom_meta_core::agent::memory::SlidingWindowMemory;
+        let sw = SlidingWindowMemory::new(4);
+        let provider: Box<dyn cleanroom_meta_core::agent::memory::MemoryProvider> =
+            Box::new(sw);
+        let mutex = tokio::sync::Mutex::new(provider);
+        let arc: Arc<tokio::sync::Mutex<Box<dyn cleanroom_meta_core::agent::memory::MemoryProvider>>> =
+            Arc::new(mutex);
+        let ctx = LoopContext::new("t", "s", "a", "sp", "um").with_memory_opt(Some(arc.clone()));
+        assert!(ctx.memory.is_some());
+        // Arc identity — same pointer.
+        let same = ctx.memory.as_ref().unwrap();
+        assert!(Arc::ptr_eq(same, &arc));
+    }
+
+    #[test]
+    fn loop_context_with_memory_opt_none_keeps_none() {
+        // Conversely: `with_memory_opt(None)` should leave the field
+        // as `None` (don't accidentally set it to a default).
+        let ctx = LoopContext::new("t", "s", "a", "sp", "um").with_memory_opt(None);
+        assert!(ctx.memory.is_none());
+    }
+
+    #[test]
+    fn loop_stats_memory_messages_at_call_defaults_to_zero() {
+        let s = LoopStats::default();
+        assert_eq!(s.memory_messages_at_call, 0);
+    }
+}
+
+// ============================================================================
+// PLAN2 Phase F.3 tests
+// ============================================================================
+#[cfg(test)]
+mod skill_injection_tests {
+    use super::*;
+    use cleanroom_skill::{SelectionPolicy, SkillIndex, SkillScope};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn fake_skill(name: &str, desc: &str, body: &str) -> cleanroom_skill::SkillDocument {
+        cleanroom_skill::SkillDocument {
+            id: format!("{name}+h"),
+            name: name.to_string(),
+            description: desc.to_string(),
+            license: None,
+            compatibility: None,
+            tags: vec![],
+            allowed_tools: vec!["fs.read_file".into()],
+            denied_tools: vec![],
+            allowed_paths: vec!["src/**/*.rs".into()],
+            staging: None,
+            output_schema: None,
+            gates: vec![],
+            divergence_spec: None,
+            applies_to: vec![],
+            token_budget: 4096,
+            priority: "high".into(),
+            trigger: false,
+            body: body.to_string(),
+            path: PathBuf::from("/x"),
+            scope: SkillScope::Builtin,
+            hash: "h".into(),
+            last_modified: None,
+            sdef_shard_uri: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn no_skill_index_passthrough() {
+        let out = build_system_prompt_with_skill("base", None, None, None, None, 1000);
+        assert_eq!(out, "base");
+    }
+
+    #[test]
+    fn empty_skill_index_passthrough() {
+        let idx = SkillIndex::default();
+        let out = build_system_prompt_with_skill("base", Some(&idx), None, None, None, 1000);
+        assert_eq!(out, "base");
+    }
+
+    #[test]
+    fn catalog_injected_when_skill_index_provided() {
+        let idx = SkillIndex::new(vec![fake_skill("rust-x", "rust tool", "body")]);
+        let out = build_system_prompt_with_skill("base", Some(&idx), None, None, None, 1000);
+        assert!(out.contains("base"));
+        assert!(out.contains("<available_skills>"));
+        assert!(out.contains("rust-x"));
+    }
+
+    #[test]
+    fn tier2_injected_when_query_and_policy_given() {
+        let idx = SkillIndex::new(vec![fake_skill(
+            "rust-analysis",
+            "rust trait impl",
+            "very long body...",
+        )]);
+        let p = SelectionPolicy {
+            top_k: 1,
+            min_score: 0.0,
+            ..Default::default()
+        };
+        let out = build_system_prompt_with_skill(
+            "base",
+            Some(&idx),
+            Some("rust analysis"),
+            Some(&p),
+            None,
+            200,
+        );
+        assert!(out.contains("[preloaded]"));
+        assert!(out.contains("[/preloaded]"));
+        assert!(out.contains("rust-analysis"));
     }
 }

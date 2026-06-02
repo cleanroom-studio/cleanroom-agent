@@ -28,3 +28,4 @@ pub mod compat_tools;
 pub mod eval_tools;
 pub mod task_queue_tools;
 pub mod bridge_tools;
+pub mod skill_tools;

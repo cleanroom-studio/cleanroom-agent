@@ -1,0 +1,24 @@
+[package]
+name = "cleanroom-skill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Skills / Replication Protocol engine for cleanroom-studio — agent skills discovery, parsing, scoring, and tool authorization."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+ignore = { workspace = true }
+walkdir = "2.5"
+glob = "0.3"
+sdef-core = { path = "../sdef-core" }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

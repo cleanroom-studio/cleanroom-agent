@@ -30,6 +30,10 @@ pub struct LlmCallLog {
     pub iterations: u32,
     pub tool_calls: u32,
     pub cost_estimate_usd: f64,
+    /// Phase 0.10: how many history messages `run_loop` prepended to
+    /// this LLM call (from `MemoryProvider::recall()`). `0` means
+    /// no memory was attached or the memory was empty.
+    pub memory_messages_at_call: i64,
     /// One of: `completed` / `aborted` / `max_iter` / `refused` / `failed`.
     pub status: String,
     pub error: Option<String>,
@@ -68,8 +72,9 @@ impl LlmCallLogRepository {
             r#"INSERT INTO llm_call_log (
                 call_id, task_id, session_id, agent_type, app_name, model,
                 prompt_tokens, completion_tokens, duration_ms, iterations,
-                tool_calls, cost_estimate_usd, status, error, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+                tool_calls, cost_estimate_usd, memory_messages_at_call,
+                status, error, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"#,
             params![
                 rec.call_id,
                 rec.task_id,
@@ -83,6 +88,7 @@ impl LlmCallLogRepository {
                 rec.iterations,
                 rec.tool_calls,
                 rec.cost_estimate_usd,
+                rec.memory_messages_at_call,
                 rec.status,
                 rec.error,
                 rec.created_at,
@@ -99,7 +105,8 @@ impl LlmCallLogRepository {
             .prepare(
                 "SELECT call_id, task_id, session_id, agent_type, app_name, model,
                         prompt_tokens, completion_tokens, duration_ms, iterations,
-                        tool_calls, cost_estimate_usd, status, error, created_at
+                        tool_calls, cost_estimate_usd, memory_messages_at_call,
+                        status, error, created_at
                  FROM llm_call_log WHERE call_id = ?1",
             )
             .map_err(|e| DbError::QueryFailed(e.to_string()))?;
@@ -121,7 +128,8 @@ impl LlmCallLogRepository {
             .prepare(
                 "SELECT call_id, task_id, session_id, agent_type, app_name, model,
                         prompt_tokens, completion_tokens, duration_ms, iterations,
-                        tool_calls, cost_estimate_usd, status, error, created_at
+                        tool_calls, cost_estimate_usd, memory_messages_at_call,
+                        status, error, created_at
                  FROM llm_call_log WHERE task_id = ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| DbError::QueryFailed(e.to_string()))?;
@@ -140,7 +148,8 @@ impl LlmCallLogRepository {
             .prepare(
                 "SELECT call_id, task_id, session_id, agent_type, app_name, model,
                         prompt_tokens, completion_tokens, duration_ms, iterations,
-                        tool_calls, cost_estimate_usd, status, error, created_at
+                        tool_calls, cost_estimate_usd, memory_messages_at_call,
+                        status, error, created_at
                  FROM llm_call_log ORDER BY created_at DESC LIMIT ?1",
             )
             .map_err(|e| DbError::QueryFailed(e.to_string()))?;
@@ -187,9 +196,10 @@ impl LlmCallLogRepository {
             iterations: row.get(9)?,
             tool_calls: row.get(10)?,
             cost_estimate_usd: row.get(11)?,
-            status: row.get(12)?,
-            error: row.get(13)?,
-            created_at: row.get(14)?,
+            memory_messages_at_call: row.get(12)?,
+            status: row.get(13)?,
+            error: row.get(14)?,
+            created_at: row.get(15)?,
         })
     }
 }
@@ -218,6 +228,7 @@ mod tests {
             iterations: 1,
             tool_calls: 0,
             cost_estimate_usd: 0.0169,
+            memory_messages_at_call: 0,
             status: status.to_string(),
             error: None,
             created_at: "2026-06-02T12:00:00Z".to_string(),

@@ -45,7 +45,7 @@
 //! - **Permission checks** — Task mutation tools verify `agent_id` matches `assigned_to`
 //! - **Request logging** — All tool calls are traced with arguments and result summary
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -527,6 +527,10 @@ impl CleanroomMcpServer {
             // Workflow control (cross-platform, replaces OS signals)
             "pause_workflow" => self.handle_pause_workflow(args_value),
             "resume_workflow" => self.handle_resume_workflow(args_value),
+            "skill_list" => self.handle_skill_list(args_value),
+            "skill_activate" => self.handle_skill_activate(args_value),
+            "skill_refresh" => self.handle_skill_refresh(args_value),
+            "skill_validate" => self.handle_skill_validate(args_value),
             _ => Err(format!("Unknown tool: {}", name)),
         }
     }
@@ -881,7 +885,6 @@ impl CleanroomMcpServer {
     }
 
     fn handle_export_sdef_to_disk(&self, args: Value) -> Result<Value, String> {
-        use std::path::Path;
         #[derive(serde::Deserialize)]
         struct P { document_name: String, output_dir: String }
         let p: P = serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -2005,6 +2008,137 @@ impl CleanroomMcpServer {
     }
 }
 
+impl CleanroomMcpServer {
+    // ============ Skill tool handlers (PLAN2 Phase F) ============
+
+    /// `skill_list` — list available skills (Tier 1 catalog).
+    fn handle_skill_list(&self, args: Value) -> Result<Value, String> {
+        use tools::skill_tools::SkillListParams;
+        let params: SkillListParams = serde_json::from_value(args)
+            .map_err(|e| format!("invalid skill_list args: {e}"))?;
+        // Resolve the project root: prefer CWD, fall back to the directory
+        // containing `db_path`.
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let index = cleanroom_skill::load_skill_index_with_extras(
+            &root,
+            &[], // built-in + home are added by the strict loader
+            )
+            .map_err(|e| format!("load_skill_index: {e}"))?;
+        let mut summaries: Vec<Value> = index
+            .summaries()
+            .into_iter()
+            .filter(|s| match &params.scope {
+                Some(scope_str) => format!("{:?}", s.scope).eq_ignore_ascii_case(scope_str),
+                None => true,
+            })
+            .filter(|s| match &params.task_type {
+                Some(tt) => index
+                    .find_by_name(&s.name)
+                    .map(|d| d.applies_to_task(tt))
+                    .unwrap_or(false),
+                None => true,
+            })
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "description": s.description,
+                    "scope": format!("{:?}", s.scope),
+                    "priority": s.priority,
+                    "token_budget": s.token_budget,
+                    "allowed_tools": s.allowed_tools,
+                    "allowed_paths": s.allowed_paths,
+                    "applies_to": s.applies_to,
+                })
+            })
+            .collect();
+        summaries.sort_by(|a, b| {
+            b["priority"]
+                .as_str()
+                .unwrap_or("normal")
+                .cmp(a["priority"].as_str().unwrap_or("normal"))
+                .then_with(|| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")))
+        });
+        Ok(json!({ "skills": summaries, "count": summaries.len() }))
+    }
+
+    /// `skill_activate` — load a skill's full body (Tier 2).
+    fn handle_skill_activate(&self, args: Value) -> Result<Value, String> {
+        use tools::skill_tools::SkillActivateParams;
+        let params: SkillActivateParams = serde_json::from_value(args)
+            .map_err(|e| format!("invalid skill_activate args: {e}"))?;
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let index = cleanroom_skill::load_skill_index_with_extras(&root, &[])
+            .map_err(|e| format!("load_skill_index: {e}"))?;
+        let skill = index
+            .find_by_name(&params.name)
+            .ok_or_else(|| format!("skill not found: {}", params.name))?;
+        let budget = params.token_budget.unwrap_or(skill.token_budget) as usize;
+        let instruction = skill.engineer_instruction(budget);
+        Ok(json!({
+            "name": skill.name,
+            "description": skill.description,
+            "body": instruction,
+            "allowed_tools": skill.allowed_tools,
+            "denied_tools": skill.denied_tools,
+            "allowed_paths": skill.allowed_paths,
+            "staging": skill.staging,
+            "output_schema": skill.output_schema,
+            "gates": skill.gates,
+            "divergence_spec": skill.divergence_spec,
+            "applies_to": skill.applies_to,
+            "token_budget": skill.token_budget,
+        }))
+    }
+
+    /// `skill_refresh` — re-scan the filesystem for skill changes.
+    fn handle_skill_refresh(&self, args: Value) -> Result<Value, String> {
+        use tools::skill_tools::SkillRefreshParams;
+        let params: SkillRefreshParams = serde_json::from_value(args)
+            .map_err(|e| format!("invalid skill_refresh args: {e}"))?;
+        let root = match params.path {
+            Some(p) => PathBuf::from(p),
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let index = cleanroom_skill::load_skill_index_strict(&root)
+            .map_err(|e| format!("refresh: {e}"))?;
+        Ok(json!({
+            "root": root.display().to_string(),
+            "count": index.len(),
+            "skills": index.summaries().into_iter().map(|s| json!({
+                "name": s.name,
+                "scope": format!("{:?}", s.scope),
+                "hash": s.hash,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `skill_validate` — validate a SKILL.md file against the spec.
+    fn handle_skill_validate(&self, args: Value) -> Result<Value, String> {
+        use tools::skill_tools::SkillValidateParams;
+        let params: SkillValidateParams = serde_json::from_value(args)
+            .map_err(|e| format!("invalid skill_validate args: {e}"))?;
+        let path = PathBuf::from(&params.path);
+        let report = cleanroom_skill::validate_skill_dir(&path)
+            .map_err(|e| format!("validate: {e}"))?;
+        let issues: Vec<Value> = report
+            .issues()
+            .map(|i| {
+                json!({
+                    "level": format!("{:?}", i.level),
+                    "message": i.message,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "valid": report.is_valid(),
+            "error_count": report.errors.len(),
+            "warning_count": report.warnings.len(),
+            "issues": issues,
+        }))
+    }
+}
+
 // The impl CleanroomMcpServer block is closed above.
 // ============ Tool Definitions (i18n) ============
 
@@ -2044,6 +2178,7 @@ fn all_tools() -> Vec<Tool> {
     use tools::lsp_tools::*;
     use tools::consistency_tools::*;
     use tools::compat_tools::*;
+    use tools::skill_tools::*;
 
     vec![
         // Task Management (keys: mcp.xxx)
@@ -2127,6 +2262,12 @@ fn all_tools() -> Vec<Tool> {
         // Workflow Control — cross-platform pause/resume (docs/15 §10)
         make_tool::<tools::bridge_tools::PauseResumeParams>("pause_workflow", "mcp.pause_workflow", false),
         make_tool::<tools::bridge_tools::PauseResumeParams>("resume_workflow", "mcp.resume_workflow", false),
+
+        // Skills (PLAN2 Phase F) — see docs/21-skills-system.md §6
+        make_tool::<SkillListParams>("skill_list", "mcp.skill_list", true),
+        make_tool::<SkillActivateParams>("skill_activate", "mcp.skill_activate", true),
+        make_tool::<SkillRefreshParams>("skill_refresh", "mcp.skill_refresh", false),
+        make_tool::<SkillValidateParams>("skill_validate", "mcp.skill_validate", true),
     ]
 }
 

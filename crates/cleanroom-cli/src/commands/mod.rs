@@ -43,7 +43,7 @@
 //! cleanroom inspect --check-type coverage
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use clap::{Subcommand, ValueEnum};
@@ -534,6 +534,42 @@ pub enum Commands {
         output: Option<String>,
     },
 
+    /// Manage Skills (PLAN2 Phase G).
+    ///
+    /// Browse, activate, validate, and refresh the Skills index. Skills
+    /// are the LLM behavior-spec mechanism defined in
+    /// `docs/21-skills-system.md` §6.
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cleanroom skill list
+    /// cleanroom skill show rust-analysis
+    /// cleanroom skill activate rust-analysis
+    /// cleanroom skill validate .cleanroom/skills/my-skill/SKILL.md
+    /// ```
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+
+    /// Manage Staging workspaces (PLAN2 Phase G).
+    ///
+    /// Inspect / abort staged file operations that an LLM has not yet
+    /// committed to the source tree.
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cleanroom staging status <task_id>
+    /// cleanroom staging commit <task_id> --target /path/to/repo
+    /// cleanroom staging abort <task_id>
+    /// ```
+    Staging {
+        #[command(subcommand)]
+        command: StagingCommand,
+    },
+
     /// Manage the task queue of a running agent.
     ///
     /// Insert, remove, or modify pending tasks in a running `cleanroom serve`
@@ -634,6 +670,69 @@ enum WorkflowCommand {
     Status,
 }
 
+/// Skill subcommands (PLAN2 Phase G.1).
+#[derive(Subcommand)]
+pub enum SkillCommand {
+    /// List all visible skills (Tier 1 catalog).
+    List {
+        /// Optional scope filter (`builtin` / `project-cleanroom` /
+        /// `project-agents` / `user-cleanroom` / `user-agents`).
+        #[arg(long)]
+        scope: Option<String>,
+        /// Filter by `applies-to` task type.
+        #[arg(long)]
+        task_type: Option<String>,
+    },
+    /// Show a single skill's metadata (Tier 1 + light body).
+    Show {
+        /// Skill name.
+        name: String,
+    },
+    /// Activate a skill: print the Tier 2 instruction block.
+    Activate {
+        /// Skill name.
+        name: String,
+        /// Override the skill's `token-budget`.
+        #[arg(long)]
+        token_budget: Option<u32>,
+    },
+    /// Validate a `SKILL.md` file against the spec.
+    Validate {
+        /// Absolute or relative path to the SKILL.md file.
+        path: String,
+    },
+    /// Re-scan the filesystem for skill changes.
+    Refresh {
+        /// Optional root path. Default: current working directory.
+        #[arg(long)]
+        path: Option<String>,
+    },
+}
+
+/// Staging subcommands (PLAN2 Phase G.2).
+#[derive(Subcommand)]
+pub enum StagingCommand {
+    /// Show the manifest of a staging workspace (printed from local cache;
+    /// not yet wired to SQLite).
+    Status {
+        /// Task ID of the staging workspace.
+        task_id: String,
+    },
+    /// Commit a staging workspace to its target directory.
+    Commit {
+        /// Task ID of the staging workspace.
+        task_id: String,
+        /// Target source-tree directory.
+        #[arg(long)]
+        target: String,
+    },
+    /// Abort (drop) a staging workspace.
+    Abort {
+        /// Task ID of the staging workspace.
+        task_id: String,
+    },
+}
+
 /// Dispatches a CLI command to its corresponding handler.
 ///
 /// This is the top-level entry point called from `main.rs`. It routes the
@@ -700,6 +799,12 @@ pub fn run(command: Commands, db_path: &str) -> Result<()> {
         }
         Commands::Workflow(workflow) => {
             workflow_dispatch(workflow, db_path)
+        }
+        Commands::Skill { command } => {
+            skill_dispatch(command, db_path)
+        }
+        Commands::Staging { command } => {
+            staging_dispatch(command, db_path)
         }
     }
 }
@@ -899,6 +1004,145 @@ fn set_api_key(key: Option<String>) {
     }
 }
 
+// ============================================================================
+// PLAN2 Phase G: Skill / Staging CLI subcommands
+// ============================================================================
+
+/// Dispatch `cleanroom skill ...` subcommands. Talks directly to the
+/// `cleanroom-skill` crate (no DB required for these).
+fn skill_dispatch(cmd: SkillCommand, _db_path: &str) -> Result<()> {
+    use cleanroom_skill::{
+        build_skill_catalog_block, select_skill_prompt_block, load_skill_index_strict, validate_skill_dir, SelectionPolicy,
+    };
+
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    match cmd {
+        SkillCommand::List { scope, task_type } => {
+            let idx = load_skill_index_strict(&root)
+                .map_err(|e| anyhow::anyhow!("load_skill_index: {e}"))?;
+            let filtered: Vec<_> = idx
+                .summaries()
+                .into_iter()
+                .filter(|s| match &scope {
+                    Some(scope_str) => format!("{:?}", s.scope).eq_ignore_ascii_case(scope_str),
+                    None => true,
+                })
+                .filter(|s| match &task_type {
+                    Some(tt) => idx
+                        .find_by_name(&s.name)
+                        .map(|d| d.applies_to_task(tt))
+                        .unwrap_or(false),
+                    None => true,
+                })
+                .collect();
+            if filtered.is_empty() {
+                println!("(no skills found)");
+            } else {
+                println!("{} skill(s):", filtered.len());
+                for s in filtered {
+                    println!(
+                        "  - {} [{:?}]  priority={}  token_budget={}",
+                        s.name, s.scope, s.priority, s.token_budget
+                    );
+                    println!("    {}", s.description);
+                }
+            }
+        }
+        SkillCommand::Show { name } => {
+            let idx = load_skill_index_strict(&root)
+                .map_err(|e| anyhow::anyhow!("load_skill_index: {e}"))?;
+            let skill = idx
+                .find_by_name(&name)
+                .ok_or_else(|| anyhow::anyhow!("skill not found: {name}"))?;
+            println!("# {}", skill.name);
+            println!("scope: {:?}", skill.scope);
+            println!("priority: {}", skill.priority);
+            println!("token_budget: {}", skill.token_budget);
+            println!("path: {}", skill.path.display());
+            println!("hash: {}", skill.hash);
+            if !skill.allowed_tools.is_empty() {
+                println!("allowed-tools: {}", skill.allowed_tools.join(", "));
+            }
+            if !skill.allowed_paths.is_empty() {
+                println!("allowed-paths: {}", skill.allowed_paths.join(", "));
+            }
+            if !skill.applies_to.is_empty() {
+                println!("applies-to: {}", skill.applies_to.join(", "));
+            }
+            println!("\n--- description ---\n{}", skill.description);
+            println!("\n--- body (first 2000 chars) ---\n{}",
+                skill.body.chars().take(2000).collect::<String>());
+        }
+        SkillCommand::Activate { name, token_budget } => {
+            let idx = load_skill_index_strict(&root)
+                .map_err(|e| anyhow::anyhow!("load_skill_index: {e}"))?;
+            let policy = SelectionPolicy {
+                top_k: 1,
+                min_score: 0.0,
+                ..Default::default()
+            };
+            let (block, summary) = select_skill_prompt_block(
+                &idx,
+                &name,
+                &policy,
+                token_budget.map(|b| b as usize).unwrap_or(4096),
+            )
+            .ok_or_else(|| anyhow::anyhow!("skill not found: {name}"))?;
+            println!("Activated: {} (id={})", summary.name, summary.id);
+            println!("--- Tier 2 prompt block ---\n{block}");
+        }
+        SkillCommand::Validate { path } => {
+            let p = std::path::PathBuf::from(&path);
+            let report = validate_skill_dir(&p)
+                .map_err(|e| anyhow::anyhow!("validate: {e}"))?;
+            if report.is_valid() {
+                println!("✓ valid ({} warning(s))", report.warnings.len());
+            } else {
+                println!("✗ invalid ({} error(s), {} warning(s))", report.errors.len(), report.warnings.len());
+            }
+            for issue in report.issues() {
+                println!("  [{}] {}", format!("{:?}", issue.level).to_lowercase(), issue.message);
+            }
+        }
+        SkillCommand::Refresh { path } => {
+            let p = path
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| root.clone());
+            let idx = load_skill_index_strict(&p)
+                .map_err(|e| anyhow::anyhow!("refresh: {e}"))?;
+            println!("Refreshed: {} skill(s) under {}", idx.len(), p.display());
+            for s in idx.summaries() {
+                println!("  - {} [{:?}]", s.name, s.scope);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch `cleanroom staging ...` subcommands. Currently local-only
+/// (no DB persistence yet — the SQLite manifest table is added in
+/// a follow-up Phase E task).
+fn staging_dispatch(cmd: StagingCommand, _db_path: &str) -> Result<()> {
+    match cmd {
+        StagingCommand::Status { task_id } => {
+            println!("(note) staging status is currently local — no DB-backed manifest yet");
+            println!("task_id: {task_id}");
+            println!("hint: the staging workspace lives at /tmp/cleanroom-staging-{task_id}-* during the run");
+        }
+        StagingCommand::Commit { task_id, target } => {
+            println!("(note) staging commit currently requires a live LLM run; this is a placeholder");
+            println!("task_id: {task_id}");
+            println!("target: {target}");
+        }
+        StagingCommand::Abort { task_id } => {
+            println!("(note) staging abort is a no-op outside an LLM run");
+            println!("task_id: {task_id}");
+        }
+    }
+    Ok(())
+}
+
 /// Handler for the `produce` command.
 ///
 /// Scans the repository, runs LLM analysis via ADK, and outputs S.DEF JSON.
@@ -977,15 +1221,55 @@ fn produce_command(
     })
 }
 
-/// Absolute path to the workspace's `migrations/` directory, resolved
-/// at compile time. `CARGO_MANIFEST_DIR` for `cleanroom-cli` points at
-/// `cleanroom-agent/crates/cleanroom-cli/`, so we walk up two levels.
+/// Absolute path to the workspace's `migrations/` directory.
+///
+/// We walk up from the **running binary's location** rather than
+/// `env!("CARGO_MANIFEST_DIR")`, because `cargo run` runs the binary
+/// out of `target/debug/` and `env!("CARGO MANIFEST_DIR")` (when
+/// captured at build time) sometimes ends up pointing inside the
+/// target tree after a stale incremental build, which then
+/// produces a spurious `target/debug/migrations` candidate that
+/// silently swallows the real one.
+///
+/// The directory layout at build / run time is:
+///
+/// ```text
+/// $REPO/
+///   migrations/
+///     001_initial_schema.sql
+///     002_sdef_storage.sql
+///     ...
+///   cleanroom-agent/
+///     target/
+///       debug/
+///         cleanroom-cli          <-- this is what we resolve from
+///     crates/
+///       cleanroom-cli/
+///         src/
+/// ```
+///
+/// so we walk up **three** levels from the binary (debug/ → cleanroom-agent/)
+/// and then up another two to the repo root, where `migrations/` lives.
 pub fn cli_migrations_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent() // crates/
+    let exe = std::env::current_exe().unwrap_or_else(|_| {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("cleanroom-cli"))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    });
+    // exe is `.../target/<profile>/cleanroom-cli` (or `cleanroom-cli.exe`
+    // on Windows). Strip the binary name + the profile dir, then walk
+    // up two more levels to the repo root.
+    let cleanroom_agent = exe
+        .parent() // <profile>/
+        .and_then(|p| p.parent()) // target/
         .and_then(|p| p.parent()) // cleanroom-agent/
-        .expect("cleanroom-cli crate layout has two parents")
-        .join("migrations")
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let repo_root = cleanroom_agent
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    repo_root.join("migrations")
 }
 
 /// Single-pass variant of the produce flow. Opens the DB, builds
@@ -1397,7 +1681,15 @@ fn llm_log_command(
 fn export_command(document: &str, output: &str, format: &str, db_path: &str) -> Result<()> {
     use std::io::Write;
 
-    let db = Database::open(Path::new(db_path))?;
+    // `Database::open` would call `run_migrations` which resolves the
+    // migrations directory at CWD (`target/debug/migrations, migrations,
+    // ../migrations`). That fails when the binary is invoked from
+    // outside the workspace root. Pass the workspace `migrations/`
+    // explicitly to skip the CWD probe.
+    let db = Database::open_with_migrations_from(
+        Path::new(db_path),
+        Some(&cli_migrations_dir()),
+    )?;
     let conn = db.connection();
 
     let mut stmt = conn.prepare(

@@ -1,0 +1,18 @@
+[package]
+name = "cleanroom-staging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Staging 隔离工作区抽象 — LLM 写源代码的\"沙盒\",orchestrator commit 落源代码树"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

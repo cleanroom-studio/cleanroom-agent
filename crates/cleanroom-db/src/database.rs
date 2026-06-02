@@ -196,6 +196,13 @@ impl Database {
         // `LlmCallLogRepository` can run without a migrations directory.
         conn.execute_batch(crate::embedded_schema::LLM_CALL_LOG_SCHEMA_SQL)
             .map_err(|e| DbError::MigrationFailed(e.to_string()))?;
+        // Phase 0.10: also apply the `memory_messages_at_call` column
+        // (migrations/009). Same rationale as above — production
+        // paths use `run_pending_at`; the in-memory factory inlines
+        // the SQL so unit tests for the new column don't need a
+        // migrations directory.
+        conn.execute_batch(crate::embedded_schema::LLM_CALL_LOG_MEMORY_SCHEMA_SQL)
+            .map_err(|e| DbError::MigrationFailed(e.to_string()))?;
         drop(conn);
         Ok(db)
     }

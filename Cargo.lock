@@ -369,6 +369,7 @@ dependencies = [
  "cleanroom-meta-llm",
  "cleanroom-meta-protocol",
  "cleanroom-prompt",
+ "cleanroom-skill",
  "futures",
  "glob",
  "ignore",
@@ -417,6 +418,8 @@ dependencies = [
  "cleanroom-i18n",
  "cleanroom-mcp",
  "cleanroom-meta-llm",
+ "cleanroom-skill",
+ "cleanroom-staging",
  "indicatif",
  "rusqlite",
  "sdef-core",
@@ -498,6 +501,7 @@ dependencies = [
  "cleanroom-db",
  "cleanroom-i18n",
  "cleanroom-lsp",
+ "cleanroom-skill",
  "futures",
  "rmcp",
  "rmcp-macros",
@@ -633,6 +637,39 @@ dependencies = [
  "tracing",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "cleanroom-skill"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "glob",
+ "ignore",
+ "rusqlite",
+ "sdef-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "cleanroom-staging"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

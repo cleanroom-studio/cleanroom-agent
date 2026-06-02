@@ -207,6 +207,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             cost_limit_usd: Some(0.05),
             on_call_complete: None,
             tools: None,
+            memory: cleanroom_agent::llm_loop::MemoryConfig::None,
         });
     assert!(agent.has_llm(), "agent must have LLM attached for this demo");
 

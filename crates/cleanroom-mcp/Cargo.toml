@@ -9,6 +9,7 @@ cleanroom-agent = { path = "../cleanroom-agent" }
 cleanroom-db = { path = "../cleanroom-db" }
 cleanroom-i18n = { path = "../cleanroom-i18n" }
 cleanroom-lsp = { path = "../cleanroom-lsp" }
+cleanroom-skill = { path = "../cleanroom-skill" }
 sdef-core = { path = "../sdef-core" }
 rmcp.workspace = true
 rmcp-macros.workspace = true
