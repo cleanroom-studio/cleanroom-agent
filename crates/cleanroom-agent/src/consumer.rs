@@ -29,7 +29,7 @@ use tracing::{info, warn};
 use rusqlite::params;
 use serde_json;
 
-use cleanroom_db::{Database, DbError, Task, TaskRepository, TaskType, TypeCacheRepository};
+use cleanroom_db::{Database, DbError, LlmCallLogRepository, Task, TaskRepository, TaskType, TypeCacheRepository};
 use cleanroom_meta_core::tool::MetaToolT;
 use cleanroom_meta_llm::MetaLlm;
 
@@ -207,6 +207,17 @@ pub struct ConsumerAgent {
     /// [`ConsumerAgent::with_memory`] for the strategy to take
     /// effect.
     memory: Option<Arc<crate::llm_loop::LoopContextMemory>>,
+    /// Phase 0.9 (closed 2026-06-02): the LLM call audit log. When
+    /// `Some`, every `run_loop` invocation inside
+    /// `generate_code_with_llm` appends a row to `llm_call_log` via
+    /// the `on_call_complete` hook (same wiring as the Producer
+    /// agent — see `producer.rs:558-568`). The CLI's `consume`
+    /// command uses this so the consume-side LLM calls land in the
+    /// same audit table as the producer-side ones; `cleanroom-cli
+    /// llm-log --recent` then shows the full pipeline picture.
+    /// `None` (the default) preserves the pre-0.9 behavior (no audit
+    /// log on the consume path).
+    llm_call_logger: Option<Arc<LlmCallLogRepository>>,
 }
 
 impl ConsumerAgent {
@@ -221,6 +232,7 @@ impl ConsumerAgent {
             tools: None,
             memory_config: crate::llm_loop::MemoryConfig::default(),
             memory: None,
+            llm_call_logger: None,
         }
     }
 
@@ -229,6 +241,19 @@ impl ConsumerAgent {
     /// will fail with a clear "no LLM configured" error.
     pub fn with_llm(mut self, llm: Arc<dyn MetaLlm>) -> Self {
         self.llm = Some(llm);
+        self
+    }
+
+    /// Phase 0.9 (closed 2026-06-02): attach the LLM call audit log.
+    /// When set, every `run_loop` invocation inside
+    /// `generate_code_with_llm` appends a row to `llm_call_log` via
+    /// the `on_call_complete` hook (same pattern as
+    /// `ProducerAgent::with_llm_call_logger`). The CLI's `consume`
+    /// command uses this so the consume-side LLM calls show up in
+    /// `cleanroom-cli llm-log --recent` alongside the producer-side
+    /// ones.
+    pub fn with_llm_call_logger(mut self, logger: Arc<LlmCallLogRepository>) -> Self {
+        self.llm_call_logger = Some(logger);
         self
     }
 
@@ -425,6 +450,21 @@ impl ConsumerAgent {
                 let mut loop_cfg = self.loop_config.clone();
                 loop_cfg.tools = self.tools.clone();
                 loop_cfg.memory = self.memory_config;
+                // Phase 0.9 (closed 2026-06-02): wire the LLM call
+                // audit log so consume-side calls show up in
+                // `llm_call_log` alongside producer-side ones. Mirrors
+                // `producer.rs:558-568`.
+                if let Some(logger) = self.llm_call_logger.clone() {
+                    loop_cfg.on_call_complete = Some(Arc::new(move |log: cleanroom_db::LlmCallLog| {
+                        if let Err(e) = logger.create(&log) {
+                            tracing::warn!(
+                                error = %e,
+                                call_id = %log.call_id,
+                                "llm_call_log: failed to persist LlmCallLog"
+                            );
+                        }
+                    }));
+                }
                 let outcome = run_loop(llm.clone(), ctx, &loop_cfg)
                     .await
                     .map_err(|e| DbError::QueryFailed(format!("LLM call failed: {e}")))?;
@@ -512,6 +552,19 @@ impl ConsumerAgent {
                 let mut loop_cfg = self.loop_config.clone();
                 loop_cfg.tools = self.tools.clone();
                 loop_cfg.memory = self.memory_config;
+                // Phase 0.9 (closed 2026-06-02): same audit-log wire as
+                // the first `run_loop` call site in this method.
+                if let Some(logger) = self.llm_call_logger.clone() {
+                    loop_cfg.on_call_complete = Some(Arc::new(move |log: cleanroom_db::LlmCallLog| {
+                        if let Err(e) = logger.create(&log) {
+                            tracing::warn!(
+                                error = %e,
+                                call_id = %log.call_id,
+                                "llm_call_log: failed to persist LlmCallLog"
+                            );
+                        }
+                    }));
+                }
                 let outcome = run_loop(llm.clone(), ctx, &loop_cfg)
                     .await
                     .map_err(|e| DbError::QueryFailed(format!("LLM call failed: {e}")))?;

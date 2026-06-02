@@ -1429,7 +1429,20 @@ fn consume_command(
     let rt = tokio::runtime::Runtime::new().context(tr_global!("cli.error_runtime"))?;
     rt.block_on(async {
         use cleanroom_db::Database;
-        // First, import the S.DEF file into the DB (same as the legacy path).
+        // First, apply migrations to the DB file. We open it once via
+        // `Database::open_with_migrations_from` (which runs every
+        // `migrations/*.sql` that's newer than the DB's recorded
+        // version), then drop the handle. Without this, the next line
+        // — `rusqlite::Connection::open(db_path)` for the
+        // `SdefImporter` — would land on an empty DB with no
+        // `sdef_documents` / `data_models` / ... tables and the import
+        // would fail with `no such table: sdef_documents` (we hit
+        // this on the Phase 0.10.4 end-to-end #3 run, 2026-06-02).
+        let _apply = Database::open_with_migrations_from(
+            Path::new(db_path),
+            Some(&cli_migrations_dir()),
+        )?;
+        // Now read the S.DEF and import it.
         let sdef_content = std::fs::read_to_string(sdef)?;
         let sdef: sdef_core::SoftwareDefinition = serde_json::from_str(&sdef_content)?;
         let importer = cleanroom_db::export_import::SdefImporter::new(
@@ -1437,6 +1450,7 @@ fn consume_command(
         );
         importer.import(&sdef)?;
 
+        // Re-open as a managed `Database` for the consumer / validator.
         let db = Arc::new(Database::open_with_migrations_from(
             Path::new(db_path),
             Some(&cli_migrations_dir()),
@@ -1456,6 +1470,14 @@ fn consume_command(
         if !use_legacy_template {
             let llm = build_llm_from_env(model.as_deref(), api_key.as_deref())?;
             consumer = consumer.with_llm(llm);
+            // Phase 0.9 (closed 2026-06-02): wire the LLM call audit
+            // log so consume-side LLM calls show up in `llm_call_log`
+            // alongside the producer-side ones. Mirrors the producer
+            // wiring in `run_produce_one_pass` (see L:1311-1318).
+            let consume_log_repo = Arc::new(
+                cleanroom_db::LlmCallLogRepository::new_with_arc(db.connection_arc()),
+            );
+            consumer = consumer.with_llm_call_logger(consume_log_repo);
         }
         consumer.run_consume().await.map_err(|e| anyhow::anyhow!("consume failed: {e}"))?;
 
