@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use sdef_core::*;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use chrono::Utc;
 
 use crate::module_partitioner::{Module, ModuleType};
@@ -265,24 +265,29 @@ impl SdefMapper {
             }
         }
 
-        // Fallback: use the existing regex-based analysis (only for known languages)
-        if stem == stem.to_lowercase() && !stem.contains('.') {
-            entities.push(IrEntity::DataModel {
-                name: to_pascal_case(stem),
-                description: Some(format!("Data entity from {}", file.relative_path.display())),
-                attributes: vec![
-                    IrAttribute { name: "id".to_string(), attr_type: "UUID".to_string(), description: Some("Primary identifier".to_string()), required: true },
-                ],
-            });
-
-            entities.push(IrEntity::Function {
-                name: format!("get_{}", stem),
-                description: Some(format!("Retrieve {}", stem)),
-                inputs: vec![IrParam { name: "id".to_string(), param_type: "UUID".to_string(), description: Some("Entity identifier".to_string()) }],
-                outputs: vec![IrParam { name: "result".to_string(), param_type: to_pascal_case(stem), description: Some("Found entity".to_string()) }],
-            });
-        }
-
+        // Phase 0.5++ gap (closed 2026-06-02): no more "fake entity" fallback.
+        //
+        // The previous version fabricated a `DataModel { id: UUID }` and a
+        // `Function { get_xxx }` whenever the file stem was lowercase and
+        // tree-sitter failed. That injected bogus entities into the S.DEF
+        // for *every* Rust/TS/Python file the tree-sitter build couldn't
+        // handle (e.g. files using syntax features the bundled grammar
+        // doesn't yet cover). Producers downstream then had no way to tell
+        // the real entities from the fabricated ones.
+        //
+        // The LLM path is now the source of truth for file analysis (see
+        // `ProducerMode::Llm` and `analyze_file_with_llm` in
+        // `cleanroom-agent/src/producer.rs`), so the template path's
+        // honest "I can't parse this" answer is empty `entities` — not
+        // made-up schema. Phase 5's `EvaluationMode::TemplateOnly` will
+        // baseline what the template path actually produces; the
+        // "fabricated entity" baseline is no longer relevant.
+        warn!(
+            file = %file.relative_path.display(),
+            stem = %stem,
+            "analyze_file: tree-sitter parse failed; returning empty entities \
+             (no fake-fallback since Phase 0.5++)"
+        );
         entities
     }
 
@@ -748,14 +753,53 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_file_creates_entities() {
+    fn test_analyze_file_returns_empty_when_tree_sitter_fails() {
+        // Phase 0.5++ (2026-06-02): the old "fake entity" fallback that
+        // fabricated `DataModel { id: UUID }` + `Function { get_xxx }` for
+        // every lowercase-stem file is gone. When tree-sitter can't read /
+        // parse the file (e.g. a non-existent path, or a grammar the
+        // build doesn't cover), `analyze_file` should now return empty
+        // entities — the LLM path is the source of truth, not the
+        // template path.
         let db = Arc::new(cleanroom_db::Database::in_memory().unwrap());
         let mapper = SdefMapper::new(MapperConfig::default(), db);
         let file = sample_file("user.rs", "rust");
         let entities = mapper.analyze_file(&file);
-        assert_eq!(entities.len(), 2);
-        assert!(matches!(entities[0], IrEntity::DataModel { .. }));
-        assert!(matches!(entities[1], IrEntity::Function { .. }));
+        assert!(
+            entities.is_empty(),
+            "analyze_file should return empty when tree-sitter fails (no fake fallback), \
+             got {} entities: {:?}",
+            entities.len(),
+            entities
+        );
+    }
+
+    #[test]
+    fn test_analyze_file_skips_non_source_languages() {
+        // `source_languages` whitelist guards against analyzing HTML / CSS
+        // / Ruby etc. with the Rust/TS tree-sitter grammars. Files outside
+        // the whitelist must produce zero entities (no fake fallback).
+        let db = Arc::new(cleanroom_db::Database::in_memory().unwrap());
+        let mapper = SdefMapper::new(MapperConfig::default(), db);
+        let file = sample_file("styles.css", "css");
+        let entities = mapper.analyze_file(&file);
+        assert!(entities.is_empty(), "non-source-language file should be skipped");
+    }
+
+    #[test]
+    fn test_analyze_file_skips_when_no_language_detected() {
+        // `file.language == None` (scanner couldn't infer a language) must
+        // also short-circuit to zero entities — same "no fake data" rule.
+        let file = SourceFile {
+            path: std::path::PathBuf::from("user.rs"),
+            language: None,
+            size_bytes: 100,
+            relative_path: std::path::PathBuf::from("user.rs"),
+        };
+        let db = Arc::new(cleanroom_db::Database::in_memory().unwrap());
+        let mapper = SdefMapper::new(MapperConfig::default(), db);
+        let entities = mapper.analyze_file(&file);
+        assert!(entities.is_empty(), "language-less file should be skipped");
     }
 
     #[test]

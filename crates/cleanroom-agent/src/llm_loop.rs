@@ -455,10 +455,36 @@ pub async fn run_loop(
     }
 
     // 2. Single LLM call.
-    let response = llm
-        .chat(&messages, None)
-        .await
-        .map_err(|e| LoopError::LlmCall(e.to_string()))?;
+    //
+    // Phase 0.5++ (2026-06-02): when the underlying transport call blows
+    // up, fire `on_call_complete` with `status="failed"` *before* returning
+    // the error. Previously the hook only ran on the success path, so a
+    // transport / rate-limit / context-length error left no audit
+    // record — making it impossible to see why an `LlmAnalyzeFile` task
+    // didn't make it through `run_loop`. The hook records the LLM call
+    // *event*, so the failure belongs in the log too.
+    let response = match llm.chat(&messages, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Populate the stats with what we *do* know: the wall-clock
+            // cost so far and the memory context we prepended. Token
+            // counts are 0 because the call never returned a response.
+            {
+                let mut s = lock_stats(&stats);
+                s.memory_messages_at_call = memory_prepend_count;
+                s.elapsed_ms = started.elapsed().as_millis() as u64;
+            }
+            let snapshot = lock_stats(&stats).clone();
+            let err_msg = e.to_string();
+            warn!(
+                task_id = %ctx.task_id,
+                error = %err_msg,
+                "run_loop: llm.chat failed; firing on_call_complete(failed) before returning"
+            );
+            fire_on_call_complete(cfg, &ctx, &snapshot, "failed", Some(err_msg.clone()));
+            return Err(LoopError::LlmCall(err_msg));
+        }
+    };
 
     // 3. Accumulate stats from the response. Phase 0.10 also
     // records `memory_messages_at_call` so observers can see how
@@ -739,11 +765,30 @@ pub async fn run_loop_via_basic_agent(
 
     // `MetaAgentBuilder::<_, MetaDirectAgent>` picks the single-iter executor.
     // Build is async because it sets up the LLM client + memory wiring.
-    let handle = MetaAgentBuilder::<_, MetaDirectAgent>::new(basic)
+    let handle = match MetaAgentBuilder::<_, MetaDirectAgent>::new(basic)
         .llm(llm_dyn)
         .build()
         .await
-        .map_err(|e| LoopError::LlmCall(format!("MetaBasicAgent build failed: {e}")))?;
+    {
+        Ok(h) => h,
+        Err(e) => {
+            // Phase 0.5++: same failure-path hook as in `run_loop`.
+            {
+                let mut s = lock_stats(&stats);
+                s.elapsed_ms = started.elapsed().as_millis() as u64;
+            }
+            let snapshot = lock_stats(&stats).clone();
+            let err_msg = format!("MetaBasicAgent build failed: {e}");
+            warn!(
+                task_id = %ctx.task_id,
+                error = %err_msg,
+                "run_loop_via_basic_agent: MetaAgentBuilder::build failed; \
+                 firing on_call_complete(failed) before returning"
+            );
+            fire_on_call_complete(cfg, &ctx, &snapshot, "failed", Some(err_msg.clone()));
+            return Err(LoopError::LlmCall(err_msg));
+        }
+    };
 
     // Encode the system prompt + user message into a single `MetaTask` string.
     // `MetaDirectAgent` doesn't do multi-turn -- it appends the system role
@@ -758,11 +803,26 @@ pub async fn run_loop_via_basic_agent(
 
     // `agent_handle.agent.run(task)` is async; returns a `MetaBasicAgentOutput`
     // (or its serde-encoded value) which we convert into our outcome.
-    let output: LoopAgentOutput = handle
-        .agent
-        .run(task)
-        .await
-        .map_err(|e| LoopError::LlmCall(format!("MetaBasicAgent run failed: {e}")))?;
+    let output: LoopAgentOutput = match handle.agent.run(task).await {
+        Ok(o) => o,
+        Err(e) => {
+            // Phase 0.5++: same failure-path hook as in `run_loop`.
+            {
+                let mut s = lock_stats(&stats);
+                s.elapsed_ms = started.elapsed().as_millis() as u64;
+            }
+            let snapshot = lock_stats(&stats).clone();
+            let err_msg = format!("MetaBasicAgent run failed: {e}");
+            warn!(
+                task_id = %ctx.task_id,
+                error = %err_msg,
+                "run_loop_via_basic_agent: MetaBasicAgent::run failed; \
+                 firing on_call_complete(failed) before returning"
+            );
+            fire_on_call_complete(cfg, &ctx, &snapshot, "failed", Some(err_msg.clone()));
+            return Err(LoopError::LlmCall(err_msg));
+        }
+    };
 
     // Read captured usage from the proxy and copy into the per-task stats.
     // The basic agent's chat_with_tools call already wrote into `cell`.
@@ -1304,6 +1364,57 @@ mod on_call_complete_tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].status, "failed");
         assert_eq!(logs[0].error.as_deref(), Some("transport error"));
+    }
+
+    /// Phase 0.5++ (2026-06-02): when the LLM call inside `run_loop`
+    /// (or `run_loop_via_basic_agent`) fails, we fire the audit hook
+    /// with `status="failed"` *and* populate `memory_messages_at_call`
+    /// on the snapshot — so the log row tells you "the LLM blew up
+    /// after we prepended N history messages". This test pins the
+    /// contract for the failure-path call site in `run_loop`.
+    #[test]
+    fn fire_failure_path_preserves_memory_messages_at_call() {
+        let collected: Arc<StdMutex<Vec<LlmCallLog>>> = Arc::new(StdMutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+        let cfg = LoopConfig {
+            on_call_complete: Some(Arc::new(move |log: LlmCallLog| {
+                collected_clone.lock().unwrap().push(log);
+            })),
+            ..LoopConfig::default()
+        };
+        // Mirror what `run_loop` does on the LLM-failure path: set
+        // `memory_messages_at_call` on the stats before taking the
+        // snapshot that gets passed to the hook.
+        let mut stats = sample_stats();
+        stats.memory_messages_at_call = 3; // 3 messages of history prepended
+        stats.elapsed_ms = 4_200; // wall-clock cost up to the failure
+        stats.prompt_tokens = 0; // never returned
+        stats.completion_tokens = 0; // never returned
+        fire_on_call_complete(
+            &cfg,
+            &sample_ctx(),
+            &stats,
+            "failed",
+            Some("llm.chat returned error: rate limit exceeded".to_string()),
+        );
+        let logs = collected.lock().unwrap();
+        assert_eq!(logs.len(), 1);
+        let log = &logs[0];
+        assert_eq!(log.status, "failed");
+        assert_eq!(
+            log.error.as_deref(),
+            Some("llm.chat returned error: rate limit exceeded")
+        );
+        // The audit row must reflect the prepended history even on
+        // the failure path — otherwise post-mortem analysis can't tell
+        // whether the LLM saw prior turns before it died.
+        assert_eq!(
+            log.memory_messages_at_call, 3,
+            "memory_messages_at_call must be preserved on the failure path"
+        );
+        // The wall-clock cost is also useful (helps correlate with
+        // metrics dashboards).
+        assert_eq!(log.duration_ms, 4_200);
     }
 
     #[test]
