@@ -7,7 +7,7 @@
 //!
 //! # Architecture
 //!
-//! ```
+//! ```text
 //! analyze_file_with_lsp_fallback()
 //!   │
 //!   ├─ check type_cache ──→ hit ──→ return cached
@@ -15,7 +15,7 @@
 //!   ├─ try LspServerPool.analyze_file() ──→ success ──→ cache & return
 //!   │
 //!   └─ fallback: tree-sitter parse ──→ return (no cache? optional)
-//! ```
+//! ```text
 
 use std::path::Path;
 use std::sync::Arc;

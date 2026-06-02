@@ -6,7 +6,7 @@
 //!
 //! # Architecture
 //!
-//! ```
+//! ```text
 //! EvaluationRunner::run()
 //!   ├─ Phase 1: Producer analysis → analysis quality metrics
 //!   ├─ Phase 2: Consumer generation → generation quality metrics
@@ -14,7 +14,7 @@
 //!
 //! ContinuousEval::run_loop()
 //!   └─ Periodic EvaluationRunner::run() + regression check
-//! ```
+//! ```text
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

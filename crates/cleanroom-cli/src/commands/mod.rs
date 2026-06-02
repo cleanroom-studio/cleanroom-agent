@@ -46,14 +46,102 @@
 use std::path::Path;
 use std::sync::Arc;
 use anyhow::{Result, Context};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use cleanroom_agent::{
     AgentConfig, CleanroomAgent, RunMode,
     CompatibilityMode, Fidelity, CompletenessValidator, format_report,
     VersionUpgradeAnalyzer,
+    consumer::{ConsumerAgent, ConsumerConfig},
+    llm_loop::LoopConfig,
+    producer::{ProducerAgent, ProducerConfig, ProducerMode},
 };
 use cleanroom_db::Database;
 use cleanroom_i18n::tr_global;
+use cleanroom_meta_llm::MetaLlm;
+use tracing::info;
+
+/// CLI execution mode (Phase 0.8). Maps 1:1 to the producer/consumer
+/// internal mode enums. `Both` runs both pipelines and writes a diff
+/// report under `<output>/_diff_report.txt`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliMode {
+    /// LLM-driven (default in 0.8): per-file LLM analysis, per-entity
+    /// LLM code generation. Requires an LLM API key.
+    Llm,
+    /// Template/legacy: the pre-Phase-0.5 static-analysis pipeline.
+    /// No LLM calls. Used as the Phase 5 baseline.
+    Template,
+    /// Run both modes; the second pass's output goes to
+    /// `<output>/_both_<mode>/` and a diff report is written to
+    /// `<output>/_diff_report.txt`.
+    Both,
+}
+
+/// Build an LLM from env vars + optional CLI overrides. Returns a clear
+/// error with "how to configure" guidance if no API key is found
+/// anywhere.
+pub fn build_llm_from_env(model: Option<&str>, api_key: Option<&str>) -> Result<Arc<dyn MetaLlm>> {
+    use cleanroom_meta_llm::backends::openai::OpenAiProvider;
+    use cleanroom_meta_llm::builder::MetaBuilder;
+    let key = match api_key {
+        Some(k) => k.to_string(),
+        None => std::env::var("MINIMAX_API_KEY")
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "no LLM API key found. Set one of:\n  \
+                     - MINIMAX_API_KEY (recommended for MiniMax-M3)\n  \
+                     - OPENAI_API_KEY\n  \
+                     - ANTHROPIC_API_KEY\n\n\
+                     Or pass `--api-key <KEY>` on the command line,\n\
+                     or use `--mode template` to skip the LLM entirely."
+                )
+            })?,
+    };
+    if std::env::var_os("OPENAI_BASE_URL").is_none() {
+        std::env::set_var("OPENAI_BASE_URL", "https://api.minimaxi.com/v1");
+    }
+    let model_name = model
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("EVAL_MODEL").ok())
+        .unwrap_or_else(|| "MiniMax-M3".to_string());
+    let base_url = std::env::var("OPENAI_BASE_URL")
+        .unwrap_or_else(|_| "https://api.minimaxi.com/v1".to_string());
+    let llm: Arc<OpenAiProvider> = MetaBuilder::<OpenAiProvider>::new()
+        .api_key(key)
+        .base_url(base_url)
+        .model(model_name.clone())
+        .max_tokens(1024)
+        .temperature(0.0)
+        .build()?;
+    info!(
+        model = %model_name,
+        "build_llm_from_env: constructed OpenAiProvider"
+    );
+    Ok(llm)
+}
+
+/// Build a LoopConfig from optional CLI overrides, falling back to defaults.
+pub fn loop_config_from_opts(
+    max_iterations: Option<u32>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    cost_limit_usd: Option<f64>,
+) -> LoopConfig {
+    let mut cfg = LoopConfig::default();
+    if let Some(n) = max_iterations {
+        cfg.max_iterations = n;
+    }
+    if let Some(n) = max_tokens {
+        cfg.max_tokens_per_call = n;
+    }
+    if let Some(t) = temperature {
+        cfg.temperature = t;
+    }
+    cfg.cost_limit_usd = cost_limit_usd;
+    cfg
+}
 
 /// Pipeline command: analyze code repository and produce S.DEF output.
 ///
@@ -94,6 +182,25 @@ pub enum Commands {
         /// API key for LLM provider
         #[arg(long)]
         api_key: Option<String>,
+        /// Execution mode (Phase 0.8): `llm` (default; one LlmAnalyzeFile
+        /// task per source file), `template` (legacy static-analysis
+        /// pipeline; Phase 5 baseline), or `both` (run both, write a
+        /// diff report to `<output>/_diff_report.txt`).
+        #[arg(long, value_enum, default_value_t = CliMode::Llm)]
+        mode: CliMode,
+        /// LLM loop tuning (only honored when `--mode llm` or `both`).
+        #[arg(long)]
+        max_iterations: Option<u32>,
+        /// LLM loop tuning (max_tokens per LLM call).
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// LLM sampling temperature (0.0 = deterministic, 1.0 = creative).
+        #[arg(long)]
+        temperature: Option<f32>,
+        /// Hard cap on total estimated USD cost for the run; abort with
+        /// `Aborted` if exceeded.
+        #[arg(long)]
+        cost_limit_usd: Option<f64>,
     },
 
     /// Consumption mode: read S.DEF and generate code in target language.
@@ -142,6 +249,24 @@ pub enum Commands {
         /// API key for LLM provider
         #[arg(long)]
         api_key: Option<String>,
+        /// Execution mode (Phase 0.8): `llm` (default; one run_loop
+        /// call per S.DEF entity), `template` (legacy static-analysis
+        /// pipeline; Phase 5 baseline), or `both` (run both, write a
+        /// diff report to `<output>/_diff_report.txt`).
+        #[arg(long, value_enum, default_value_t = CliMode::Llm)]
+        mode: CliMode,
+        /// LLM loop tuning (only honored when `--mode llm` or `both`).
+        #[arg(long)]
+        max_iterations: Option<u32>,
+        /// LLM loop tuning (max_tokens per LLM call).
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// LLM sampling temperature (0.0 = deterministic, 1.0 = creative).
+        #[arg(long)]
+        temperature: Option<f32>,
+        /// Hard cap on total estimated USD cost for the run.
+        #[arg(long)]
+        cost_limit_usd: Option<f64>,
     },
 
     /// Start MCP server for external tool integrations.
@@ -473,11 +598,14 @@ enum WorkflowCommand {
 /// Returns an error if the underlying handler fails. Error types vary by command.
 pub fn run(command: Commands, db_path: &str) -> Result<()> {
     match command {
-        Commands::Produce { repo, output, exclude: _, name, model, api_key } => {
-            produce_command(&repo, &output, db_path, name, model, api_key)
+        Commands::Produce { repo, output, exclude: _, name, model, api_key, mode, max_iterations, max_tokens, temperature, cost_limit_usd } => {
+            produce_command(&repo, &output, db_path, name, model, api_key, mode, max_iterations, max_tokens, temperature, cost_limit_usd)
         }
-        Commands::Consume { sdef, output, language, framework, compat_mode, fidelity, model, api_key } => {
-            consume_command(&sdef, &output, &language, framework.as_deref(), &compat_mode, &fidelity, db_path, model, api_key)
+        Commands::Consume { sdef, output, language, framework, compat_mode, fidelity, model, api_key, mode, max_iterations: _, max_tokens: _, temperature: _, cost_limit_usd: _ } => {
+            // Phase 0.8: Consume currently ignores the 4 loop-tuning
+            // flags (they apply to Producer's LLM path). The `mode`
+            // flag IS honored: llm / template / both.
+            consume_command(&sdef, &output, &language, framework.as_deref(), &compat_mode, &fidelity, db_path, model, api_key, mode)
         }
         Commands::Serve { transport } => {
             serve_command(&transport, db_path)
@@ -717,8 +845,13 @@ fn set_api_key(key: Option<String>) {
 fn produce_command(
     repo: &str, output: &str, db_path: &str,
     name: Option<String>, model: Option<String>, api_key: Option<String>,
+    mode: CliMode,
+    max_iterations: Option<u32>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    cost_limit_usd: Option<f64>,
 ) -> Result<()> {
-    set_api_key(api_key);
+    set_api_key(api_key.clone());
     use tokio::runtime::Runtime;
     let project_name = name.unwrap_or_else(|| {
         Path::new(repo).file_name()
@@ -726,27 +859,196 @@ fn produce_command(
             .unwrap_or_else(|| "unnamed".to_string())
     });
 
+    // Validate LLM env if we need one.
+    if !matches!(mode, CliMode::Template) {
+        // Try to build the LLM up-front so we fail fast with a clear
+        // "how to configure" message.
+        let _ = build_llm_from_env(model.as_deref(), api_key.as_deref())?;
+    }
+
     let rt = Runtime::new().context(tr_global!("cli.error_runtime"))?;
     rt.block_on(async {
-        let agent_config = AgentConfig {
-            db_path: Path::new(db_path).to_path_buf(),
-            model_name: model,
-            agent_name: "cleanroom-producer".to_string(),
-            ..AgentConfig::default()
-        };
-        let agent = CleanroomAgent::new(agent_config)
-            .context(tr_global!("cli.error_orchestrator"))?;
+        // Phase 0.8: for `both` mode we run the producer twice (once
+        // template, once llm) and write a diff report. Each pass
+        // gets its own subdir under the requested `output`.
+        match mode {
+            CliMode::Llm => {
+                run_produce_one_pass(
+                    repo, output, db_path, &project_name,
+                    model.as_deref(), api_key.as_deref(),
+                    ProducerMode::Llm,
+                    max_iterations, max_tokens, temperature, cost_limit_usd,
+                ).await?;
+            }
+            CliMode::Template => {
+                run_produce_one_pass(
+                    repo, output, db_path, &project_name,
+                    None, None,
+                    ProducerMode::Template,
+                    None, None, None, None,
+                ).await?;
+            }
+            CliMode::Both => {
+                // Template pass: into <output>/_template
+                let template_output = format!("{output}/_template");
+                run_produce_one_pass(
+                    repo, &template_output, db_path, &project_name,
+                    None, None,
+                    ProducerMode::Template,
+                    None, None, None, None,
+                ).await?;
+                // LLM pass: into <output>/_llm
+                let llm_output = format!("{output}/_llm");
+                run_produce_one_pass(
+                    repo, &llm_output, db_path, &project_name,
+                    model.as_deref(), api_key.as_deref(),
+                    ProducerMode::Llm,
+                    max_iterations, max_tokens, temperature, cost_limit_usd,
+                ).await?;
+                // Diff report
+                let report_path = format!("{output}/_diff_report.txt");
+                write_produce_diff_report(&template_output, &llm_output, &report_path)?;
+                println!("== both-mode diff report: {report_path}");
+            }
+        }
 
-        let pn = project_name.clone();
-        agent.run(RunMode::Produce {
-            repo_path: Path::new(repo).to_path_buf(),
-            output_path: Path::new(output).to_path_buf(),
-            project_name,
-        }).await?;
-
-        println!("{}", tr_global!("cli.produce_complete", pn));
+        println!("{}", tr_global!("cli.produce_complete", &project_name));
         Ok(())
     })
+}
+
+/// Absolute path to the workspace's `migrations/` directory, resolved
+/// at compile time. `CARGO_MANIFEST_DIR` for `cleanroom-cli` points at
+/// `cleanroom-agent/crates/cleanroom-cli/`, so we walk up two levels.
+pub fn cli_migrations_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent() // crates/
+        .and_then(|p| p.parent()) // cleanroom-agent/
+        .expect("cleanroom-cli crate layout has two parents")
+        .join("migrations")
+}
+
+/// Single-pass variant of the produce flow. Opens the DB, builds
+/// `ProducerConfig` + `LoopConfig` per `mode`, attaches the LLM
+/// (when needed), and runs `ProducerAgent::run_repo_analysis`.
+async fn run_produce_one_pass(
+    repo: &str, output: &str, db_path: &str, project_name: &str,
+    model: Option<&str>, api_key: Option<&str>,
+    mode: ProducerMode,
+    max_iterations: Option<u32>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    cost_limit_usd: Option<f64>,
+) -> Result<()> {
+    use cleanroom_db::Database;
+    let db = Arc::new(Database::open_with_migrations_from(
+        Path::new(db_path),
+        Some(&cli_migrations_dir()),
+    )?);
+    let producer_config = match mode {
+        ProducerMode::Llm => ProducerConfig::llm(),
+        ProducerMode::Template => ProducerConfig::default(),
+        ProducerMode::Both => ProducerConfig::both(),
+    };
+    let mut producer = ProducerAgent::new(producer_config, db);
+    if matches!(mode, ProducerMode::Llm | ProducerMode::Both) {
+        let llm = build_llm_from_env(model, api_key)?;
+        producer = producer.with_llm(llm);
+    }
+    if max_iterations.is_some()
+        || max_tokens.is_some()
+        || temperature.is_some()
+        || cost_limit_usd.is_some()
+    {
+        let cfg = loop_config_from_opts(
+            max_iterations, max_tokens, temperature, cost_limit_usd,
+        );
+        producer = producer.with_loop_config(cfg);
+    }
+    println!("== produce mode={mode:?} output={output}");
+    let processed = producer
+        .run_repo_analysis(Path::new(repo), project_name)
+        .await
+        .map_err(|e| anyhow::anyhow!("produce failed: {e}"))?;
+    println!("== processed {processed} tasks");
+    // Auto-export the resulting S.DEF (Phase 0.8: makes `produce --output X`
+    // actually leave an S.DEF file on disk for downstream `consume --sdef`).
+    // Failures are non-fatal: the pipeline still ran, we just couldn't
+    // serialize; the user can re-run `cleanroom-cli export --document ...`.
+    let sdef_path = format!("{output}/{project_name}.json");
+    match export_command(project_name, &sdef_path, "json", db_path) {
+        Ok(()) => println!("== exported sdef to {sdef_path}"),
+        Err(e) => eprintln!(
+            "warn: post-produce export failed: {e}\n\
+             (use `cleanroom-cli export --document {project_name} --output {sdef_path}` manually)"
+        ),
+    }
+    Ok(())
+}
+
+/// Write a simple text diff report for `both` mode: list files
+/// generated in each pass, mark identical / different / only-in-one.
+fn write_produce_diff_report(
+    template_dir: &str,
+    llm_dir: &str,
+    report_path: &str,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    let tpl = std::path::Path::new(template_dir);
+    let llm = std::path::Path::new(llm_dir);
+    let mut all_files: BTreeSet<String> = BTreeSet::new();
+    let mut template_files: Vec<String> = Vec::new();
+    let mut llm_files: Vec<String> = Vec::new();
+
+    fn walk(p: &Path, prefix: &str, out: &mut Vec<String>) -> std::io::Result<()> {
+        if !p.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(p)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type()?.is_dir() {
+                walk(&entry.path(), &format!("{prefix}{name}/"), out)?;
+            } else {
+                out.push(format!("{prefix}{name}"));
+            }
+        }
+        Ok(())
+    }
+    walk(tpl, "", &mut template_files).ok();
+    walk(llm, "", &mut llm_files).ok();
+    for f in &template_files {
+        all_files.insert(f.clone());
+    }
+    for f in &llm_files {
+        all_files.insert(f.clone());
+    }
+
+    let mut report = String::new();
+    report.push_str("# Both-mode diff report (template vs LLM producer output)\n\n");
+    for f in &all_files {
+        let in_t = template_files.contains(f);
+        let in_l = llm_files.contains(f);
+        if in_t && in_l {
+            let t_content = std::fs::read_to_string(tpl.join(f)).unwrap_or_default();
+            let l_content = std::fs::read_to_string(llm.join(f)).unwrap_or_default();
+            if t_content == l_content {
+                report.push_str(&format!("  IDENTICAL: {f}\n"));
+            } else {
+                report.push_str(&format!("  DIFFERENT: {f}  ({} vs {} bytes)\n",
+                    t_content.len(), l_content.len()));
+            }
+        } else if in_t {
+            report.push_str(&format!("  ONLY-IN-TEMPLATE: {f}\n"));
+        } else {
+            report.push_str(&format!("  ONLY-IN-LLM: {f}\n"));
+        }
+    }
+    if let Some(parent) = std::path::Path::new(report_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(report_path, report)?;
+    Ok(())
 }
 
 /// Handler for the `consume` command.
@@ -756,8 +1058,9 @@ fn consume_command(
     sdef: &str, output: &str, language: &str, framework: Option<&str>,
     compat_mode: &str, fidelity: &str, db_path: &str,
     model: Option<String>, api_key: Option<String>,
+    mode: CliMode,
 ) -> Result<()> {
-    set_api_key(api_key);
+    set_api_key(api_key.clone());
     println!("{}", tr_global!("cli.consume_step1", sdef));
 
     let cm = match compat_mode {
@@ -774,26 +1077,39 @@ fn consume_command(
 
     let rt = tokio::runtime::Runtime::new().context(tr_global!("cli.error_runtime"))?;
     rt.block_on(async {
-        let agent_config = AgentConfig {
-            db_path: Path::new(db_path).to_path_buf(),
-            model_name: model,
-            agent_name: "cleanroom-consumer".to_string(),
-            ..AgentConfig::default()
-        };
-        let agent = CleanroomAgent::new(agent_config)
-            .context(tr_global!("cli.error_orchestrator"))?;
+        use cleanroom_db::Database;
+        // First, import the S.DEF file into the DB (same as the legacy path).
+        let sdef_content = std::fs::read_to_string(sdef)?;
+        let sdef: sdef_core::SoftwareDefinition = serde_json::from_str(&sdef_content)?;
+        let importer = cleanroom_db::export_import::SdefImporter::new(
+            rusqlite::Connection::open(db_path)?,
+        );
+        importer.import(&sdef)?;
 
-        agent.run(RunMode::Consume {
-            sdef_path: Path::new(sdef).to_path_buf(),
-            output_path: Path::new(output).to_path_buf(),
+        let db = Arc::new(Database::open_with_migrations_from(
+            Path::new(db_path),
+            Some(&cli_migrations_dir()),
+        )?);
+        let use_legacy_template = matches!(mode, CliMode::Template);
+        let consumer_config = ConsumerConfig {
             language: language.to_string(),
             framework: framework.map(|s| s.to_string()),
-            compat_mode: cm,
+            compatibility_mode: cm,
             fidelity: fid,
-        }).await?;
+            output_path: Path::new(output).to_path_buf(),
+            use_legacy_template,
+            llm: None,
+            loop_config: LoopConfig::default(),
+        };
+        let mut consumer = ConsumerAgent::new(consumer_config, db.clone());
+        if !use_legacy_template {
+            let llm = build_llm_from_env(model.as_deref(), api_key.as_deref())?;
+            consumer = consumer.with_llm(llm);
+        }
+        consumer.run_consume().await.map_err(|e| anyhow::anyhow!("consume failed: {e}"))?;
 
         // Run completeness validation
-        let validator = CompletenessValidator::new(agent.db().clone());
+        let validator = CompletenessValidator::new(db);
         match validator.validate("") {
             Ok(report) => println!("{}", format_report(&report)),
             Err(_) => {}

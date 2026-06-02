@@ -18,6 +18,7 @@
 //! | [`contracts`] | `contracts` | Interfaces, classes, enums, APIs |
 //! | [`behavior`] | `behavior` | [`FunctionSpec`], flows, state machines |
 //! | [`ui`] | `ui` | Screens, components, navigation |
+//! | [`ui_figma`] | — | Figma-specific UI extensions (variants, modes, grids, provenance) |
 //! | [`tests`] | `tests` | Test specifications |
 //! | [`reconstruction`] | `reconstruction_rules` | Code generation directives |
 //! | [`reconstruction_policy`] | `reconstruction_policy` | PTDL — cross-language/paradigm directives |
@@ -48,6 +49,7 @@ pub mod data_model;
 pub mod contracts;
 pub mod behavior;
 pub mod ui;
+pub mod ui_figma;
 pub mod tests;
 pub mod reconstruction;
 pub mod reconstruction_policy;   // PTDL — ElementOrigin, ParadigmMetadata, LibrarySubstitution, TransformationHint

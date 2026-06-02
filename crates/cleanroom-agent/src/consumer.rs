@@ -759,6 +759,13 @@ impl ConsumerAgent {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    /// Self-contained consume flow (Phase 0.8 CLI entry point).
+    /// Delegates to `generate_code` which dispatches on
+    /// `use_legacy_template`. Exists so the CLI has a single named
+    /// entry point.
+    pub async fn run_consume(&self) -> Result<(), DbError> {
+        self.generate_code().await
+    }
 }
 
 // ============================================================================

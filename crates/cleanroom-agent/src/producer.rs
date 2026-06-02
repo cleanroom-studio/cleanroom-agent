@@ -42,7 +42,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use cleanroom_db::{Database, DbError, Task, TaskRepository, TaskType};
+use cleanroom_db::{Database, DbError, Task, TaskRepository, TaskStatus, TaskType};
 use cleanroom_meta_llm::MetaLlm;
 use tracing::{info, instrument, warn};
 
@@ -511,6 +511,69 @@ impl ProducerAgent {
     pub async fn heartbeat(&self, task_id: &str) -> Result<(), DbError> {
         let repo = TaskRepository::new(self.db.connection_arc());
         repo.heartbeat(task_id)
+    }
+
+    /// Self-contained repository-analysis flow (Phase 0.8 CLI entry point).
+    ///
+    /// 1. Inserts a `RepoAnalyze` task into the queue
+    /// 2. Processes tasks in a loop until the queue is drained
+    /// 3. Returns when no more `LlmAnalyzeFile` (or other) tasks are
+    ///    claimable by this agent
+    ///
+    /// This is the orchestrator-free path; the CLI uses it to bypass
+    /// the legacy `CleanroomAgent::run(RunMode::Produce)` flow which
+    /// depends on the full Orchestrator infrastructure.
+    pub async fn run_repo_analysis(
+        &self,
+        repo_path: &Path,
+        project_name: &str,
+    ) -> Result<usize, DbError> {
+        let task_repo = TaskRepository::new(self.db.connection_arc());
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let task = Task {
+            task_id: task_id.clone(),
+            task_type: TaskType::RepoAnalyze,
+            status: TaskStatus::Pending,
+            priority: 10,
+            input_json: serde_json::json!({
+                "document": project_name,
+                "project_name": project_name,
+                "repo_path": repo_path.to_string_lossy(),
+            })
+            .to_string(),
+            output_json: None,
+            error_message: None,
+            assigned_to: None,
+            progress: 0.0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+            retry_count: 0,
+            max_retries: 3,
+            last_heartbeat: None,
+            dependencies_json: "[]".to_string(),
+            version: 1,
+        };
+        task_repo.create(&task)?;
+        info!(
+            project = %project_name,
+            task_id = %task_id,
+            "run_repo_analysis: scheduled RepoAnalyze task"
+        );
+
+        // Process tasks in a loop until nothing is claimable.
+        let mut processed = 0usize;
+        loop {
+            match self.process_next_task().await? {
+                None => break,
+                Some(t) => {
+                    info!(task_id = %t.task_id, task_type = ?t.task_type, "run_repo_analysis: processed task");
+                    processed += 1;
+                }
+            }
+        }
+        info!(processed, "run_repo_analysis: queue drained");
+        Ok(processed)
     }
 }
 

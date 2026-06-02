@@ -33,6 +33,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::ui_figma::{
+    UIComponentProperty, UIComponentVariant, UIImportProvenance,
+    UILayoutGrid, UIVariableMode,
+};
+
 // ============================================================================
 // User Interface root
 // ============================================================================
@@ -59,6 +64,11 @@ pub struct UserInterface {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub component_taxonomy: Option<Vec<UIComponentType>>,
+
+    /// Provenance for UI elements imported from a design tool.
+    /// See [`UIImportProvenance`] and `S.DEF/proposals/0000-figma-ui-import.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_provenance: Option<UIImportProvenance>,
 }
 
 // ============================================================================
@@ -88,6 +98,16 @@ pub struct UIDesignSystem {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub themes: Option<Vec<UIDesignTheme>>,
+
+    /// Variable modes (Figma: light / dark / brand-specific).
+    /// See [`UIVariableMode`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable_modes: Option<Vec<UIVariableMode>>,
+
+    /// Layout grids (Figma's `layoutGrids` on a frame).
+    /// See [`UILayoutGrid`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_grids: Option<Vec<UILayoutGrid>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -144,8 +164,22 @@ pub struct UIDocument {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UIVariable {
+    /// Type discriminator. Stored as a string to preserve Pen-compatible
+    /// values like `"color"`, `"number"`, `"string"`, `"boolean"`.
+    #[serde(rename = "type")]
     pub type_: String,
+
     pub value: serde_json::Value,
+
+    /// Source collection (Figma "VariableCollection"). When imported
+    /// from Figma, this is the collection's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+
+    /// Multi-mode values. When present, `value` is treated as the
+    /// default mode's value; per-mode overrides live here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_values: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Base element shared by all Pen visual nodes.
@@ -355,6 +389,43 @@ pub struct UIFrame {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slot: Option<serde_json::Value>,
+
+    // ---- Figma auto-layout extensions (PTDL §0000-figma-ui-import) ----
+
+    /// Auto-layout sizing mode for the primary axis.
+    /// Mirrors Figma's `primaryAxisSizingMode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_axis_sizing_mode: Option<UIAxisSizingMode>,
+
+    /// Auto-layout sizing mode for the counter axis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counter_axis_sizing_mode: Option<UIAxisSizingMode>,
+
+    /// Layout alignment relative to the parent. Mirrors Figma's `layoutAlign`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_align: Option<UILayoutAlign>,
+
+    /// Layout grow factor. Mirrors Figma's `layoutGrow` (0 = fixed, 1 = grow).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_grow: Option<u32>,
+}
+
+/// Figma auto-layout axis sizing mode. `"auto"` ≈ `fit_content`;
+/// `"fixed"` keeps the explicit width/height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UIAxisSizingMode {
+    Auto,
+    Fixed,
+}
+
+/// Figma layout alignment. Maps to Pen's `width: "fill_container"` /
+/// `height: "fill_container"` when set to `Stretch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UILayoutAlign {
+    Stretch,
+    Inherit,
 }
 
 /// Text element.
@@ -624,4 +695,14 @@ pub struct UIComponentType {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interaction_rules: Option<Vec<String>>,
+
+    /// When present, this component is a Figma-style component SET
+    /// (one logical component with multiple variants). See [`UIComponentVariant`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variants: Option<Vec<UIComponentVariant>>,
+
+    /// Property descriptors for variant selection
+    /// (Figma `componentPropertyDefinitions`). See [`UIComponentProperty`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<Vec<UIComponentProperty>>,
 }

@@ -5,6 +5,8 @@ members = [
     "crates/cleanroom-db",
     "crates/cleanroom-mcp",
     "crates/cleanroom-lsp",
+    "crates/cleanroom-figma",
+    "crates/cleanroom-sketch",
     "crates/cleanroom-agent",
     "crates/cleanroom-cli",
     "crates/cleanroom-i18n",

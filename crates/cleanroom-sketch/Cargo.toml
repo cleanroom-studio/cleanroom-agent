@@ -1,0 +1,34 @@
+[package]
+name = "cleanroom-sketch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sketch → S.DEF UI import pipeline. Supports both the Sketch Cloud REST API and the binary .sketch file format (ZIP of JSON)."
+
+[dependencies]
+# Workspace
+sdef-core = { path = "../sdef-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# HTTP client for the Sketch Cloud REST API
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# ZIP reader for the binary .sketch file format
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+# Hex encoding for sha256 output
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
