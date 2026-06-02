@@ -27,6 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::reconstruction_policy::ElementOrigin;
 use super::versioning::{CompatibilityMapping, DeprecationInfo};
 
 /// A Data Model describes a data entity.
@@ -64,6 +65,10 @@ pub struct DataModel {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physical_design: Option<PhysicalDesign>,
+
+    /// Reconstruction provenance (PTDL) — see [`ElementOrigin`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ElementOrigin>,
 }
 
 /// An attribute of a data entity.
@@ -110,6 +115,10 @@ pub struct DataAttribute {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constraints: Option<Vec<String>>,
+
+    /// Reconstruction provenance (PTDL) — see [`ElementOrigin`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ElementOrigin>,
 }
 
 /// A relationship between data entities.

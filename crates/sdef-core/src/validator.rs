@@ -264,7 +264,7 @@ mod tests {
             entity: "User".to_string(),
             status: None, version: None, deprecated: None,
             description: None, logical_model: None, attributes: None,
-            validation_rules: None, physical_design: None,
+            validation_rules: None, physical_design: None, origin: None,
             relationships: Some(vec![DataRelationship {
                 kind: "has_many".to_string(),
                 target: "Post".to_string(),
@@ -293,6 +293,7 @@ mod tests {
             implements: Some(vec!["UserService".to_string()]),
             dependencies: None,
             methods: None,
+            origin: None,
         };
         let sdef = SoftwareDefinition {
             sdef_version: "2026-05-27".to_string(),
@@ -302,7 +303,7 @@ mod tests {
                     name: "OtherInterface".to_string(),
                     is_abstract: false, status: None, version: None,
                     deprecated: None, description: None,
-                    methods: None, invariants: None,
+                    methods: None, invariants: None, origin: None,
                 }]),
                 classes: Some(vec![class]),
                 ..Default::default()
@@ -329,6 +330,7 @@ mod tests {
             complexity: None,
             pure_function: false,
             edge_cases: None,
+            origin: None,
         };
         let sdef = SoftwareDefinition {
             sdef_version: "2026-05-27".to_string(),

@@ -25,6 +25,8 @@
 //! | Behavior | [`Behavior`] | Functions, flows, state machines |
 //! | UI | [`UserInterface`] | Screens, components, navigation |
 //! | Tests | [`TestContract`] | Test specifications |
+//! | Reconstruction Rules | [`ReconstructionRules`] | Time-dimension generation directives (v1 vs v2) |
+//! | Reconstruction Policy (PTDL) | [`ReconstructionPolicy`] | Language-dimension directives (C vs Rust) |
 //! | Versioning | [`Vec<VersionRecord>`] | Version history and migrations |
 //! | Dependencies | [`Vec<Dependency>`] | External dependencies |
 //! | Deployment | [`Deployment`] | Runtime and deployment requirements |
@@ -158,6 +160,7 @@ mod tests {
                     deprecated: false,
                     compatibility: None,
                     constraints: None,
+                    origin: None,
                 },
                 DataAttribute {
                     name: "email".to_string(),
@@ -173,11 +176,13 @@ mod tests {
                     deprecated: false,
                     compatibility: None,
                     constraints: None,
+                    origin: None,
                 },
             ]),
             relationships: None,
             validation_rules: None,
             physical_design: None,
+            origin: None,
         };
 
         let json = serde_json::to_string_pretty(&model).unwrap();
@@ -257,6 +262,7 @@ mod tests {
                 condition: "Duplicate email".to_string(),
                 expected_behavior: "Return error".to_string(),
             }]),
+            origin: None,
         };
 
         let json = serde_json::to_string(&func).unwrap();

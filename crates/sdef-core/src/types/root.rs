@@ -23,7 +23,8 @@
 //! ├── behavior
 //! ├── ui
 //! ├── tests
-//! ├── reconstruction_rules
+//! ├── reconstruction_rules         (time dimension: v1 vs v2 compat)
+//! ├── reconstruction_policy        (PTDL: language dimension: C vs Rust)
 //! ├── dependencies
 //! ├── deployment
 //! └── resources
@@ -54,7 +55,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{metadata, system_boundary, design_decisions, versioning, domain, architecture, data_model, contracts, behavior, ui, tests, reconstruction, deployment, dependencies};
+use super::{metadata, system_boundary, design_decisions, versioning, domain, architecture, data_model, contracts, behavior, ui, tests, reconstruction, reconstruction_policy, deployment, dependencies};
 
 /// The root object of any S.DEF document.
 /// Contains all layers of software description.
@@ -81,7 +82,8 @@ use super::{metadata, system_boundary, design_decisions, versioning, domain, arc
 /// | `behavior` | `Behavior` | Functions, flows, state machines |
 /// | `ui` | `UserInterface` | Screens and components |
 /// | `tests` | `TestContract` | Test specifications |
-/// | `reconstruction_rules` | `ReconstructionRules` | Generation directives |
+/// | `reconstruction_rules` | `ReconstructionRules` | Generation directives (time dimension) |
+/// | `reconstruction_policy` | `ReconstructionPolicy` | PTDL — cross-language/paradigm directives |
 /// | `dependencies` | `Vec<Dependency>` | External dependencies |
 /// | `deployment` | `Deployment` | Runtime requirements |
 /// | `resources` | `Vec<Resource>` | Provided/consumed resources |
@@ -145,9 +147,15 @@ pub struct SoftwareDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tests: Option<tests::TestContract>,
 
-    /// Reconstruction rules — fidelity target, technology constraints, and directives.
+    /// Reconstruction rules — fidelity target, technology constraints, and directives
+    /// (time dimension: v1 vs v2 compatibility).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reconstruction_rules: Option<reconstruction::ReconstructionRules>,
+
+    /// Reconstruction policy (PTDL) — cross-language/paradigm directives
+    /// (language dimension: C vs Rust, OCaml vs Java). See [`reconstruction_policy::ReconstructionPolicy`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconstruction_policy: Option<reconstruction_policy::ReconstructionPolicy>,
 
     /// External software dependencies.
     #[serde(skip_serializing_if = "Option::is_none")]

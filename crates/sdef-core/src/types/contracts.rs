@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::reconstruction_policy::ElementOrigin;
 use super::versioning::{CompatibilityMapping, DeprecationInfo};
 
 /// Contracts — interfaces, classes, enums, and API endpoints.
@@ -74,6 +75,10 @@ pub struct InterfaceContract {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invariants: Option<Vec<String>>,
+
+    /// Reconstruction provenance (PTDL) — see [`ElementOrigin`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ElementOrigin>,
 }
 
 /// A concrete class contract.
@@ -101,6 +106,10 @@ pub struct ClassContract {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub methods: Option<Vec<ContractMethod>>,
+
+    /// Reconstruction provenance (PTDL) — see [`ElementOrigin`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ElementOrigin>,
 }
 
 /// A method on an interface or class contract.
@@ -127,6 +136,10 @@ pub struct ContractMethod {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<Vec<String>>,
+
+    /// Reconstruction provenance (PTDL) — see [`ElementOrigin`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ElementOrigin>,
 }
 
 /// An enumeration.
@@ -178,6 +191,10 @@ pub struct ApiContract {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<String>,
+
+    /// Reconstruction provenance (PTDL) — see [`ElementOrigin`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ElementOrigin>,
 }
 
 /// API request specification.

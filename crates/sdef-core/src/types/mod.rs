@@ -20,6 +20,7 @@
 //! | [`ui`] | `ui` | Screens, components, navigation |
 //! | [`tests`] | `tests` | Test specifications |
 //! | [`reconstruction`] | `reconstruction_rules` | Code generation directives |
+//! | [`reconstruction_policy`] | `reconstruction_policy` | PTDL — cross-language/paradigm directives |
 //! | [`deployment`] | `deployment` | Runtime requirements |
 //! | [`dependencies`] | `dependencies` | External dependencies, resources |
 //! | [`shard`] | — | [`ShardMetadata`] — internal runtime tracking (not exchanged) |
@@ -49,6 +50,7 @@ pub mod behavior;
 pub mod ui;
 pub mod tests;
 pub mod reconstruction;
+pub mod reconstruction_policy;   // PTDL — ElementOrigin, ParadigmMetadata, LibrarySubstitution, TransformationHint
 pub mod deployment;
 pub mod dependencies;
 pub mod shard;       // ShardMetadata, ShardType, ShardStatus

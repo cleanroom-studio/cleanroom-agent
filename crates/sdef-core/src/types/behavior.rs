@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::reconstruction_policy::ElementOrigin;
+
 /// Behavior — function signatures, flows, and state machines.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Behavior {
@@ -41,6 +43,10 @@ pub struct FunctionSpec {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edge_cases: Option<Vec<EdgeCase>>,
+
+    /// Reconstruction provenance (PTDL) — see [`ElementOrigin`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ElementOrigin>,
 }
 
 /// A function parameter.
