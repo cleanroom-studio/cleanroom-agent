@@ -1,0 +1,37 @@
+[package]
+name = "cleanroom-figma"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Figma → S.DEF UI import pipeline. Supports both the Figma REST API and the binary .fig file format."
+
+[dependencies]
+# Workspace
+sdef-core = { path = "../sdef-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# HTTP client for the Figma REST API
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Decompression for the .fig binary file format (zlib/deflate)
+flate2 = "1"
+
+# CRC32 for Figma file integrity checks
+crc32fast = "1"
+
+# Hex encoding for sha256 output
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
