@@ -85,6 +85,17 @@ pub mod lsp_analysis;
 // Runtime control: pause/resume (docs/15 §10)
 pub mod workflow_signal;
 
+// LLM-driven producer: structured hints for the LLM (Phase 0.2)
+pub mod auxiliary_hints;
+pub use auxiliary_hints::{FileHints, HintLine, compute_hints, compute_hints_for_file};
+
+// LLM-driven producer: S.DEF context loader (Phase 0.3)
+pub mod sdef_context;
+pub use sdef_context::{
+    load_entity_with_attributes, load_function_and_dependents, load_module_subtree,
+    load_shard_for_file, load_shard_for_task, DEFAULT_BUDGET_TOKENS,
+};
+
 // Interactive CLI modes (docs/15 §2-3)
 pub mod interaction;
 
@@ -105,18 +116,20 @@ pub mod evaluation;
 
 pub use agent::{CleanroomAgent, AgentConfig, RunMode};
 
-// LLM agent loop (Phase 0.1) — wraps `autoagents::llm::chat::ChatProvider`.
-// Phase 0.5 会切到 `autoagents::core::agent::AgentBuilder` + `BasicAgent` 实现
-// 多轮 ReAct + tool-calling,公共 API 保持稳定。
+// LLM agent loop (Phase 0.1) — wraps `cleanroom_meta_llm::chat::MetaProvider`.
+// Phase 0.5 switched the basic-agent path to `cleanroom_meta_core::agent::MetaAgentBuilder`
+// + `MetaBasicAgent` for tool-calling support; the public API is kept stable.
 pub use llm_loop::{
     run_loop, run_loop_via_basic_agent, DefaultLlmAgent, LoopAgentOutput, LoopConfig,
-    LoopContext, LoopError, LoopOutcome, LoopStats,
+    LoopContext, LoopError, LoopOutcome, LoopStats, UsageCapturingLlm, UsageCell,
 };
+pub mod mcp_tool_bridge;
+pub use mcp_tool_bridge::{McpToolBridge, McpToolSpec, mcp_tool_catalog};
 pub use naming::{DeterministicNames, Language, NameStyle, NamespaceMode};
 pub use name_resolution::{NameResolutionService, ResolvedName};
 pub use orchestrator::{Orchestrator, OrchestratorConfig, pid_file_path, port_file_path, read_port_file, write_port_file};
 pub use producer::{ProducerAgent, ProducerConfig};
-pub use consumer::{ConsumerAgent, ConsumerConfig, CompatibilityMode, Fidelity};
+pub use consumer::{ConsumerAgent, ConsumerConfig, CompatibilityMode, Fidelity, llm_regenerate_file};
 pub use repo_scanner::{scan_repository, group_by_language, ScanConfig, SourceFile};
 pub use module_partitioner::{partition_files, PartitionConfig, Module, ModuleType};
 pub use dependency_graph::{DependencyGraph, DepNode, DepNodeType, DepEdge, DepEdgeKind};

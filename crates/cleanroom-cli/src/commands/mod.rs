@@ -1033,6 +1033,7 @@ fn build_export_sdef(
                 deprecated: ar.get(9).map_err(|e| anyhow::anyhow!(e.to_string()))?,
                 compatibility: None,
                 constraints: None,
+                origin: None,
             });
         }
         drop(attr_rows);
@@ -1049,6 +1050,7 @@ fn build_export_sdef(
             relationships: None,
             validation_rules: None,
             physical_design: None,
+            origin: None,
         });
     }
     drop(rows);
@@ -1188,6 +1190,7 @@ fn build_export_sdef(
             complexity: row.get(4).map_err(|e| anyhow::anyhow!(e.to_string()))?,
             pure_function: row.get(5).map_err(|e| anyhow::anyhow!(e.to_string()))?,
             edge_cases: None,
+            origin: None,
         });
     }
     drop(fn_rows);
@@ -1242,6 +1245,7 @@ fn build_export_sdef(
                 preconditions: preconds,
                 postconditions: postconds,
                 errors,
+                origin: None,
             });
         }
         drop(m_rows);
@@ -1260,6 +1264,7 @@ fn build_export_sdef(
             description: row.get(4).map_err(|e| anyhow::anyhow!(e.to_string()))?,
             methods: if methods.is_empty() { None } else { Some(methods) },
             invariants,
+            origin: None,
         });
     }
     drop(c_rows);

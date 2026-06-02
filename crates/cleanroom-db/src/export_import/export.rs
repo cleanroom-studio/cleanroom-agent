@@ -181,6 +181,7 @@ impl SdefExporter {
                                 constraints: a.constraints_json.and_then(|c| {
                                     serde_json::from_str(&c).ok()
                                 }),
+                                origin: None,
                             })
                             .collect(),
                     )
@@ -188,6 +189,7 @@ impl SdefExporter {
                 relationships: None,
                 validation_rules: None,
                 physical_design: None,
+                origin: None,
             });
         }
 
@@ -216,6 +218,7 @@ impl SdefExporter {
                     complexity: row.get(3)?,
                     pure_function: row.get(4)?,
                     edge_cases: None,
+                    origin: None,
                 })
             })
             .map_err(|e| DbError::QueryFailed(e.to_string()))?

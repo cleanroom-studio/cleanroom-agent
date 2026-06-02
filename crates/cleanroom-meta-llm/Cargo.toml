@@ -33,7 +33,15 @@ thiserror = { workspace = true }
 
 # Non-wasm32 runtime deps
 dirs = "6"
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream"] }
+# `rustls` is REQUIRED: the OpenAI / Anthropic / Minimax endpoints are all
+# HTTPS, and without an explicit TLS backend (since we disable reqwest's
+# defaults) the `Client` will silently fail every request with a bare
+# "error sending request for url" with no inner cause. Using `rustls` rather
+# than `default-tls` to keep the build pure-Rust + musl-friendly (matches
+# the workspace's static-link release profile). Note: reqwest 0.13.4 renamed
+# the feature from `rustls-tls` to just `rustls`; the underlying crypto
+# provider (`aws-lc-rs`) is pulled in transitively.
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls"] }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 ureq = { version = "3", default-features = false, features = ["json"] }

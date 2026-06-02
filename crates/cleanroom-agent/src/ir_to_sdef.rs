@@ -346,6 +346,7 @@ impl SdefMapper {
                         deprecated: false,
                         compatibility: None,
                         constraints: None,
+                        origin: None,
                     }).collect())
                 };
 
@@ -360,6 +361,7 @@ impl SdefMapper {
                     relationships: None,
                     validation_rules: None,
                     physical_design: None,
+                    origin: None,
                 })
             } else { None }
         }).collect();
@@ -388,9 +390,11 @@ impl SdefMapper {
                             preconditions: None,
                             postconditions: None,
                             errors: None,
+                            origin: None,
                         }).collect())
                     },
                     invariants: None,
+                    origin: None,
                 })
             } else { None }
         }).collect();
@@ -430,6 +434,7 @@ impl SdefMapper {
                     complexity: None,
                     pure_function: false,
                     edge_cases: None,
+                    origin: None,
                 })
             } else { None }
         }).collect();

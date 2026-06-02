@@ -291,6 +291,7 @@ mod tests {
                     deprecated: false,
                     compatibility: None,
                     constraints: None,
+                    origin: None,
                 },
                 sdef_core::DataAttribute {
                     name: "userName".to_string(),
@@ -306,11 +307,13 @@ mod tests {
                     deprecated: false,
                     compatibility: None,
                     constraints: None,
+                    origin: None,
                 },
             ]),
             relationships: None,
             validation_rules: None,
             physical_design: None,
+            origin: None,
         }
     }
 
@@ -362,6 +365,7 @@ mod tests {
             complexity: None,
             pure_function: false,
             edge_cases: None,
+            origin: None,
         };
         let code = gen.generate_function(&func);
         assert!(code.content.contains("int calculate_sum(int a, int b)"));

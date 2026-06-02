@@ -56,4 +56,7 @@ tree-sitter-json.workspace = true
 tree-sitter-yaml.workspace = true
 
 [dev-dependencies]
-# examples 不需要再带 — autoagents 已经是主依赖
+# tests + examples need a file-based DB to exercise migrations (the in-memory
+# constructor only applies 001_initial_schema.sql, which predates the LLM
+# task types). Examples also need a tempdir to stage a sample source repo.
+tempfile = "3"
