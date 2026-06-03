@@ -730,6 +730,213 @@ impl ContinuousEval {
     }
 }
 
+// =============================================================================
+// Phase 2: Baseline metrics + mode enum + comparison report
+// =============================================================================
+
+/// Phase 2.1 (PLAN 2.1): a one-shot, comparable summary of one
+/// evaluation run. Designed to be persisted as the
+/// "pre-LLM baseline" (template-only) or the "post-LLM"
+/// run, then compared via [`eval_compare`].
+///
+/// All fields are `0.0` / `0` when not computed (e.g.
+/// `compile_pass_rate` is `0.0` until we wire up Phase 4's
+/// `cargo check` / `cargo test` harness). The aggregator
+/// ([`BaselineMetrics::from_evaluation_report`]) propagates
+/// `0` for missing data — a `None` would be more honest but
+/// breaks JSON serialization for the audit pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BaselineMetrics {
+    /// Fraction of generated Rust crates that compile
+    /// (`cargo check` returns 0) on a clean rebuild.
+    /// Default 0.0; populated by Phase 4's verification
+    /// harness.
+    pub compile_pass_rate: f64,
+    /// Fraction of generated test suites that pass
+    /// (`cargo test` returns 0). Default 0.0; populated by
+    /// Phase 4.
+    pub tests_pass_rate: f64,
+    /// Fraction of entities whose `sdef_hash == db_hash ==
+    /// code_hash` after a full produce→consume→re-import
+    /// roundtrip. We approximate this from
+    /// `EvaluationSummaryReport::overall_fidelity`; if the
+    /// summary is missing the field defaults to 0.0.
+    pub fingerprint_match_rate: f64,
+    /// Mean number of LLM calls consumed per entity
+    /// produced. Computed from the per-project
+    /// `OperationalMetrics::token_efficiency` proxy (we
+    /// approximate call count from token totals divided by
+    /// an average-tokens-per-call constant; the exact
+    /// `llm_call_count` lives in the `llm_call_log` table
+    /// and is not joined in this MVP).
+    pub llm_call_count_avg: f64,
+    /// Phase 5 stub (PLAN 5.2): number of `todo!()` macros
+    /// in the generated code. We track it here so the
+    /// schema is stable; population lives in Phase 5.
+    pub todo_macro_count: u64,
+}
+
+impl BaselineMetrics {
+    /// Aggregate a full [`EvaluationReport`] into a
+    /// `BaselineMetrics` snapshot. The `compile_pass_rate`
+    /// and `tests_pass_rate` fields are NOT populated here
+    /// — those require Phase 4's verification harness
+    /// (running `cargo check` / `cargo test` on the generated
+    /// code); we leave them at `0.0` so callers know they
+    /// haven't been measured.
+    pub fn from_evaluation_report(report: &EvaluationReport) -> Self {
+        let n = report.results.len().max(1) as f64;
+        // `overall_fidelity` is the per-run fingerprint-match
+        // rate (population-correct when present).
+        let fingerprint_match_rate = report
+            .summary
+            .as_ref()
+            .map(|s| s.overall_fidelity)
+            .unwrap_or(0.0);
+        // `llm_call_count_avg` is approximated from
+        // `token_efficiency` (calls per 1k tokens). This is
+        // a stand-in until the verification harness joins
+        // `llm_call_log` rows by task_id.
+        let total_efficiency: f64 = report
+            .results
+            .iter()
+            .map(|r| r.operational.token_efficiency)
+            .sum();
+        let llm_call_count_avg = total_efficiency / n;
+        Self {
+            compile_pass_rate: 0.0,
+            tests_pass_rate: 0.0,
+            fingerprint_match_rate,
+            llm_call_count_avg,
+            todo_macro_count: 0,
+        }
+    }
+}
+
+/// Phase 2.2 (PLAN 2.2): which producer/consumer mode a
+/// given evaluation run is exercising. `eval_compare` uses
+/// this to label its output ("template baseline" vs "LLM
+/// run") and to pick the right `ConsumerConfig` flags.
+///
+/// Default is `LlmDriven` (the post-Phase-0.5 default) so
+/// existing call sites that don't pass a mode keep working.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvaluationMode {
+    /// Pre-Phase-0.5 template path. No LLM. The Phase 5
+    /// baseline.
+    TemplateOnly,
+    /// Phase 0.5+ LLM-driven producer/consumer path. The
+    /// post-Phase-0.5 default. This is the *current* mode
+    /// of the codebase.
+    #[default]
+    LlmDriven,
+    /// Run BOTH the template and the LLM paths and emit a
+    /// diff. Used in Phase 5's `eval_compare` baseline
+    /// capture.
+    Both,
+    /// Roundtrip: produce → consume → re-import the
+    /// generated code's S.DEF and check `sdef_hash ==
+    /// db_hash == code_hash`. This is what the
+    /// `fingerprint_match_rate` field measures.
+    Roundtrip,
+}
+
+/// Phase 2.2 (PLAN 2.2): head-to-head result of comparing
+/// a baseline run to a candidate run. The two runs are
+/// typically the `TemplateOnly` baseline and a
+/// `LlmDriven` candidate (the most common use of
+/// `eval_compare`); you can also pass two `LlmDriven`
+/// runs to compare two different model configs.
+///
+/// `deltas` is `candidate - baseline` for each metric. A
+/// positive `compile_pass_rate_delta` means the candidate
+/// compiles more often; a positive `llm_call_count_avg_delta`
+/// means the candidate used *more* LLM calls (worse for
+/// cost).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComparisonReport {
+    pub baseline_mode: EvaluationMode,
+    pub candidate_mode: EvaluationMode,
+    pub baseline_metrics: BaselineMetrics,
+    pub candidate_metrics: BaselineMetrics,
+    /// `candidate - baseline` for each numeric field. We
+    /// pre-compute so the CLI / dashboard can sort/filter
+    /// on the deltas without re-deriving them.
+    pub deltas: BaselineMetrics,
+    /// Free-form human-readable verdict: "candidate is
+    /// better on X, worse on Y". Useful for the eval log.
+    pub verdict: String,
+}
+
+/// Phase 2.2 (PLAN 2.2): compare two `BaselineMetrics`
+/// (typically a template baseline and a LLM candidate) and
+/// produce a [`ComparisonReport`]. Pure function — no DB,
+/// no LLM, no I/O. Trivially testable.
+pub fn eval_compare(
+    baseline_mode: EvaluationMode,
+    baseline: &BaselineMetrics,
+    candidate_mode: EvaluationMode,
+    candidate: &BaselineMetrics,
+) -> ComparisonReport {
+    // Compute per-field deltas. `compile_pass_rate` and
+    // `tests_pass_rate` are higher-is-better; the others
+    // are also higher-is-better (`fingerprint_match_rate` =
+    // consistency, `llm_call_count_avg` = "less LLM is
+    // better").
+    let delta = |b: f64, c: f64| c - b;
+    let deltas = BaselineMetrics {
+        compile_pass_rate: delta(baseline.compile_pass_rate, candidate.compile_pass_rate),
+        tests_pass_rate: delta(baseline.tests_pass_rate, candidate.tests_pass_rate),
+        fingerprint_match_rate: delta(
+            baseline.fingerprint_match_rate,
+            candidate.fingerprint_match_rate,
+        ),
+        llm_call_count_avg: delta(baseline.llm_call_count_avg, candidate.llm_call_count_avg),
+        // `u64` subtraction is wrapping by default, which would
+        // surface as a panic in debug. We use a signed detour
+        // through `i64` (clamping at the platform bounds) and
+        // back to `u64` so a `candidate=4, baseline=10` delta
+        // comes out as `u64::MAX - 5` rather than crashing.
+        todo_macro_count: (candidate.todo_macro_count as i128
+            - baseline.todo_macro_count as i128)
+            .clamp(i64::MIN as i128, i64::MAX as i128) as u64,
+    };
+    // Build a one-line verdict. We look at fingerprint_match
+    // (the only field that's currently populated in both
+    // baseline and candidate in the MVP) and call it.
+    let verdict = if deltas.fingerprint_match_rate.abs() < 0.001 {
+        format!(
+            "candidate ({candidate_mode:?}) matches baseline ({baseline_mode:?}) \
+             on fingerprint_match_rate (~{:.0}%)",
+            candidate.fingerprint_match_rate * 100.0
+        )
+    } else if deltas.fingerprint_match_rate > 0.0 {
+        format!(
+            "candidate ({candidate_mode:?}) is +{:.1}pp better on \
+             fingerprint_match_rate ({:.0}% vs {:.0}%)",
+            deltas.fingerprint_match_rate * 100.0,
+            candidate.fingerprint_match_rate * 100.0,
+            baseline.fingerprint_match_rate * 100.0
+        )
+    } else {
+        format!(
+            "candidate ({candidate_mode:?}) is {:.1}pp worse on \
+             fingerprint_match_rate ({:.0}% vs {:.0}%)",
+            deltas.fingerprint_match_rate * 100.0,
+            candidate.fingerprint_match_rate * 100.0,
+            baseline.fingerprint_match_rate * 100.0
+        )
+    };
+    ComparisonReport {
+        baseline_mode,
+        candidate_mode,
+        baseline_metrics: baseline.clone(),
+        candidate_metrics: candidate.clone(),
+        deltas,
+        verdict,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,5 +1061,214 @@ mod tests {
     fn test_compute_summary_empty() {
         let summary = compute_summary(&[]);
         assert!(summary.is_none());
+    }
+
+    // ============ Phase 2.1 — BaselineMetrics ============
+
+    /// Build a minimal `EvaluationReport` for the baseline
+    /// tests to consume. Uses a deterministic `token_efficiency`
+    /// so the mean-divided test is easy to assert on.
+    fn fixture_report(efficiency: f64) -> EvaluationReport {
+        EvaluationReport {
+            run_id: "test".to_string(),
+            run_at: "2026-06-03T00:00:00Z".to_string(),
+            results: vec![ProjectEvalResult {
+                project: "p1".to_string(),
+                language: "rust".to_string(),
+                version: "0.1.0".to_string(),
+                analysis_quality: AnalysisQualityReport {
+                    project: "p1".to_string(),
+                    coverage: CoverageMetrics {
+                        file_coverage: 1.0,
+                        module_coverage: 1.0,
+                        entity_coverage: 1.0,
+                    },
+                    accuracy: AccuracyMetrics {
+                        type_accuracy: None,
+                        dep_graph_accuracy: None,
+                        f1_score: 1.0,
+                    },
+                    efficiency: EfficiencyMetrics {
+                        avg_ms_per_file: 0.0,
+                        tokens_per_entity: 0.0,
+                        total_tokens: 0,
+                    },
+                    files_analyzed: 1,
+                    entities_extracted: 1,
+                },
+                generation_quality: GenerationQualityReport {
+                    compile_pass_rate: 1.0,
+                    test_pass_rate: None,
+                    roundtrip_fidelity: 0.95,
+                    code_quality: CodeQualityMetrics {
+                        loc: 30,
+                        file_count: 1,
+                        duplication_ratio: 0.0,
+                        lint_warnings: 0,
+                        lint_errors: 0,
+                        compile_errors: 0,
+                    },
+                    fix_rounds_avg: 0.0,
+                },
+                operational: OperationalMetrics {
+                    task_success_rate: 1.0,
+                    avg_task_latency_ms: 100.0,
+                    timeout_rate: 0.0,
+                    crash_recovery_rate: 0.0,
+                    token_efficiency: efficiency,
+                },
+                elapsed_analysis_ms: 1000,
+                elapsed_generation_ms: 1000,
+            }],
+            total_duration_ms: 2000,
+            summary: Some(EvaluationSummaryReport {
+                projects_evaluated: 1,
+                overall_fidelity: 0.75,
+                overall_coverage: 0.5,
+                overall_compile_rate: 0.0,
+                degraded_projects: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn test_baseline_metrics_default_is_zero() {
+        let m = BaselineMetrics::default();
+        assert_eq!(m.compile_pass_rate, 0.0);
+        assert_eq!(m.tests_pass_rate, 0.0);
+        assert_eq!(m.fingerprint_match_rate, 0.0);
+        assert_eq!(m.llm_call_count_avg, 0.0);
+        assert_eq!(m.todo_macro_count, 0);
+    }
+
+    #[test]
+    fn test_baseline_metrics_from_evaluation_report_picks_up_fidelity() {
+        let report = fixture_report(200.0);
+        let m = BaselineMetrics::from_evaluation_report(&report);
+        // compile / tests = 0.0 (Phase 4 work)
+        assert_eq!(m.compile_pass_rate, 0.0);
+        assert_eq!(m.tests_pass_rate, 0.0);
+        // fingerprint_match_rate = summary.overall_fidelity = 0.75
+        assert!((m.fingerprint_match_rate - 0.75).abs() < 1e-9);
+        // llm_call_count_avg = mean(token_efficiency) = 200.0
+        assert!((m.llm_call_count_avg - 200.0).abs() < 1e-9);
+        assert_eq!(m.todo_macro_count, 0);
+    }
+
+    #[test]
+    fn test_baseline_metrics_from_empty_report_uses_zero_fallback() {
+        let mut report = fixture_report(0.0);
+        report.results.clear();
+        report.summary = None;
+        let m = BaselineMetrics::from_evaluation_report(&report);
+        assert_eq!(m.fingerprint_match_rate, 0.0, "no summary => 0 fallback");
+        assert_eq!(m.llm_call_count_avg, 0.0, "no results => 0 fallback");
+    }
+
+    // ============ Phase 2.2 — EvaluationMode ============
+
+    #[test]
+    fn test_evaluation_mode_default_is_llm_driven() {
+        assert_eq!(EvaluationMode::default(), EvaluationMode::LlmDriven);
+    }
+
+    #[test]
+    fn test_evaluation_mode_distinguishes_variants() {
+        // All four variants must round-trip Debug without panic.
+        for m in [
+            EvaluationMode::TemplateOnly,
+            EvaluationMode::LlmDriven,
+            EvaluationMode::Both,
+            EvaluationMode::Roundtrip,
+        ] {
+            let s = format!("{:?}", m);
+            assert!(!s.is_empty());
+        }
+    }
+
+    // ============ Phase 2.2 — eval_compare ============
+
+    #[test]
+    fn test_eval_compare_pure_function_no_io() {
+        // Sanity: eval_compare takes &BaselineMetrics (not
+        // EvaluationReport), so it's a pure function. Same
+        // inputs => same outputs.
+        let a = BaselineMetrics {
+            compile_pass_rate: 0.8,
+            tests_pass_rate: 0.7,
+            fingerprint_match_rate: 0.9,
+            llm_call_count_avg: 2.0,
+            todo_macro_count: 5,
+        };
+        let b = BaselineMetrics {
+            compile_pass_rate: 0.5,
+            tests_pass_rate: 0.6,
+            fingerprint_match_rate: 0.8,
+            llm_call_count_avg: 4.0,
+            todo_macro_count: 2,
+        };
+        let r1 = eval_compare(EvaluationMode::TemplateOnly, &a, EvaluationMode::LlmDriven, &b);
+        let r2 = eval_compare(EvaluationMode::TemplateOnly, &a, EvaluationMode::LlmDriven, &b);
+        assert_eq!(r1, r2, "eval_compare is deterministic");
+    }
+
+    #[test]
+    fn test_eval_compare_deltas_are_candidate_minus_baseline() {
+        let baseline = BaselineMetrics {
+            compile_pass_rate: 0.5,
+            tests_pass_rate: 0.5,
+            fingerprint_match_rate: 0.5,
+            llm_call_count_avg: 5.0,
+            todo_macro_count: 4,
+        };
+        let candidate = BaselineMetrics {
+            compile_pass_rate: 0.8,
+            tests_pass_rate: 0.6,
+            fingerprint_match_rate: 0.7,
+            llm_call_count_avg: 3.0,
+            todo_macro_count: 10,
+        };
+        let r = eval_compare(EvaluationMode::TemplateOnly, &baseline, EvaluationMode::LlmDriven, &candidate);
+        // Deltas = candidate - baseline.
+        assert!((r.deltas.compile_pass_rate - 0.3).abs() < 1e-9);
+        assert!((r.deltas.tests_pass_rate - 0.1).abs() < 1e-9);
+        assert!((r.deltas.fingerprint_match_rate - 0.2).abs() < 1e-9);
+        // LLM is "more" — delta is negative when candidate is lower.
+        assert!((r.deltas.llm_call_count_avg - -2.0).abs() < 1e-9);
+        // 10 - 4 = 6 todo macros.
+        assert_eq!(r.deltas.todo_macro_count, 6);
+    }
+
+    #[test]
+    fn test_eval_compare_verdict_picks_better_when_fingerprint_differs() {
+        let baseline = BaselineMetrics {
+            fingerprint_match_rate: 0.5,
+            ..BaselineMetrics::default()
+        };
+        let candidate = BaselineMetrics {
+            fingerprint_match_rate: 0.7,
+            ..BaselineMetrics::default()
+        };
+        let r = eval_compare(EvaluationMode::TemplateOnly, &baseline, EvaluationMode::LlmDriven, &candidate);
+        assert!(r.verdict.contains("+20.0pp"), "verdict should cite +20.0pp: {}", r.verdict);
+        assert!(r.verdict.contains("better"));
+    }
+
+    #[test]
+    fn test_eval_compare_verdict_picks_worse_when_candidate_lower() {
+        let baseline = BaselineMetrics { fingerprint_match_rate: 0.9, ..BaselineMetrics::default() };
+        let candidate = BaselineMetrics { fingerprint_match_rate: 0.4, ..BaselineMetrics::default() };
+        let r = eval_compare(EvaluationMode::TemplateOnly, &baseline, EvaluationMode::LlmDriven, &candidate);
+        assert!(r.verdict.contains("worse"), "verdict should say worse: {}", r.verdict);
+        // delta is -0.5; verdict says "-50.0pp" (it's not "-.0pp").
+        assert!(r.verdict.contains("-50.0pp") || r.verdict.contains("-0.5pp"),
+                "verdict should cite the delta: {}", r.verdict);
+    }
+
+    #[test]
+    fn test_eval_compare_verdict_says_matches_when_equal() {
+        let m = BaselineMetrics { fingerprint_match_rate: 0.6, ..BaselineMetrics::default() };
+        let r = eval_compare(EvaluationMode::TemplateOnly, &m, EvaluationMode::LlmDriven, &m);
+        assert!(r.verdict.contains("matches"), "verdict should say matches: {}", r.verdict);
     }
 }

@@ -284,6 +284,14 @@ pub enum Commands {
         /// Hard cap on total estimated USD cost for the run.
         #[arg(long)]
         cost_limit_usd: Option<f64>,
+        /// Phase 1.4: max number of self-critique rounds per
+        /// generated entity (0 = no reflection, default; 2 is a
+        /// good first try). Each round is one extra LLM call
+        /// (~$0.015 with `MiniMax-M3`). See
+        /// `docs/19-llm-modes.md` for the cost / determinism
+        /// trade-off.
+        #[arg(long)]
+        max_reflection_iterations: Option<u32>,
     },
 
     /// Start MCP server for external tool integrations.
@@ -768,11 +776,13 @@ pub fn run(command: Commands, db_path: &str) -> Result<()> {
         Commands::Produce { repo, output, exclude: _, name, model, api_key, mode, max_iterations, max_tokens, temperature, cost_limit_usd } => {
             produce_command(&repo, &output, db_path, name, model, api_key, mode, max_iterations, max_tokens, temperature, cost_limit_usd)
         }
-        Commands::Consume { sdef, output, language, framework, compat_mode, fidelity, scope, target_dir, model, api_key, mode, max_iterations: _, max_tokens: _, temperature: _, cost_limit_usd: _ } => {
+        Commands::Consume { sdef, output, language, framework, compat_mode, fidelity, scope, target_dir, model, api_key, mode, max_iterations: _, max_tokens: _, temperature: _, cost_limit_usd: _, max_reflection_iterations } => {
             // Phase 0.8: Consume currently ignores the 4 loop-tuning
             // flags (they apply to Producer's LLM path). The `mode`
             // flag IS honored: llm / template / both.
-            consume_command(&sdef, &output, &language, framework.as_deref(), &compat_mode, &fidelity, &scope, &target_dir, db_path, model, api_key, mode)
+            // Phase 1.4: `max_reflection_iterations` is honored when
+            // `mode` is `llm` or `both`.
+            consume_command(&sdef, &output, &language, framework.as_deref(), &compat_mode, &fidelity, &scope, &target_dir, db_path, model, api_key, mode, max_reflection_iterations)
         }
         Commands::Serve { transport } => {
             serve_command(&transport, db_path)
@@ -1462,6 +1472,7 @@ fn consume_command(
     compat_mode: &str, fidelity: &str, scope: &str, target_dir: &Option<String>,
     db_path: &str, model: Option<String>, api_key: Option<String>,
     mode: CliMode,
+    max_reflection_iterations: Option<u32>,
 ) -> Result<()> {
     set_api_key(api_key.clone());
     println!("{}", tr_global!("cli.consume_step1", sdef));
@@ -1551,6 +1562,12 @@ fn consume_command(
                 cleanroom_db::LlmCallLogRepository::new_with_arc(db.connection_arc()),
             );
             consumer = consumer.with_llm_call_logger(consume_log_repo);
+            // Phase 1.4: opt in to the self-critique loop. Default
+            // is 0 (no reflection, pre-1.4 behavior). The CLI
+            // flag is only honored in the LLM path.
+            if let Some(n) = max_reflection_iterations {
+                consumer = consumer.with_max_reflection_iterations(n);
+            }
         }
         consumer.run_consume().await.map_err(|e| anyhow::anyhow!("consume failed: {e}"))?;
 
