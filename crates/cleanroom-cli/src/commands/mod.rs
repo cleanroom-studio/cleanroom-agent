@@ -112,7 +112,7 @@ pub fn build_llm_from_env(model: Option<&str>, api_key: Option<&str>) -> Result<
         .api_key(key)
         .base_url(base_url)
         .model(model_name.clone())
-        .max_tokens(1024)
+        .max_tokens(4096)
         .temperature(0.0)
         .build()?;
     info!(

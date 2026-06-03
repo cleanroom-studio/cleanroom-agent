@@ -147,6 +147,18 @@ pub enum ParseError {
 const JSON_FENCE_OPEN: &str = "```json";
 const FENCE_CLOSE: &str = "```";
 
+/// Top-level keys that the `sdef_output` schema guarantees. The
+/// recovery path uses this set to decide whether a candidate
+/// `{...}` block from a fence-less LLM response is actually a
+/// `sdef_output` payload (and not, say, a stray `serde_json::Value`
+/// embedded in a Rust example).
+const SDEF_TOP_LEVEL_KEYS: &[&str] = &[
+    "data_models",
+    "contracts",
+    "functions",
+    "design_decisions",
+];
+
 /// Extract the body of the first ```json ... ``` block (or, as a
 /// fallback, the first generic ``` ... ``` block) from a free-form
 /// LLM response. Returns `None` if no fence is present.
@@ -172,10 +184,120 @@ fn extract_json_block(raw: &str) -> Option<&str> {
     Some(after_open[..close_offset].trim())
 }
 
+/// Strip `<think>...</think>` blocks from a raw LLM response. The
+/// MiniMax-M3 reasoning model emits these by default and they
+/// precede the structured JSON output. By the time we reach the
+/// recovery path the JSON fence is gone but the thinking block
+/// is still noise we need to skip.
+fn strip_think_blocks(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(open) = rest.find("<think>") {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + "<think>".len()..];
+        if let Some(close) = after_open.find("</think>") {
+            rest = &after_open[close + "</think>".len()..];
+        } else {
+            // Unterminated `<think>` — treat the rest as thinking
+            // content and stop.
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Recovery fallback: if the LLM forgot the ```json fence
+/// (a known failure mode for `MiniMax-M3` on complex source
+/// files ≥ 100 LoC where the `max_tokens=1024` cap cut the
+/// response mid-thought), try to find a balanced top-level
+/// `{...}` object in the raw text and return a slice of it.
+/// Returns `None` if no candidate is found.
+///
+/// We deliberately use byte-level scanning with a brace counter
+/// rather than a regex so that strings, escapes, and nested
+/// objects are handled correctly. The candidate must contain at
+/// least one of [`SDEF_TOP_LEVEL_KEYS`] for us to trust it.
+fn find_raw_sdef_object(raw: &str) -> Option<&str> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Found a candidate `{`; walk forward, counting
+            // unmatched braces (skipping over JSON strings so a
+            // `"` inside a string doesn't confuse the count).
+            let mut depth: i32 = 0;
+            let mut j = i;
+            let mut in_string = false;
+            let mut escape_next = false;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if escape_next {
+                    escape_next = false;
+                } else if in_string {
+                    match c {
+                        b'\\' => escape_next = true,
+                        b'"' => in_string = false,
+                        _ => {}
+                    }
+                } else {
+                    match c {
+                        b'"' => in_string = true,
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                let candidate = &raw[i..=j];
+                                if looks_like_sdef_payload(candidate) {
+                                    return Some(candidate);
+                                }
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Cheap structural check: does this `{...}` blob look like an
+/// `sdef_output` payload? We require at least one of the four
+/// known top-level keys. This filters out the case where the LLM
+/// produced a balanced but irrelevant JSON object (e.g. an
+/// example `{"x": 1}` embedded in a prose explanation).
+fn looks_like_sdef_payload(blob: &str) -> bool {
+    SDEF_TOP_LEVEL_KEYS.iter().any(|k| {
+        let needle = format!("\"{k}\"");
+        blob.contains(&needle)
+    })
+}
+
 /// Parse a `LlmAnalyzeFile` output blob into intermediate entities.
 /// Tolerant of <think>...</mm:think> blocks preceding the JSON fence.
+///
+/// Recovery ladder (in order):
+/// 1. Look for a ```json ... ``` fence — the prompt-asked format.
+/// 2. Look for a generic ``` ... ``` fence whose body starts with `{`.
+/// 3. (New in 0.5++) Strip `<think>...</think>` and scan for a
+///    balanced top-level `{...}` object that contains at least one
+///    of the `sdef_output` keys. This recovers from the failure
+///    mode where the LLM produced valid JSON but ran out of
+///    `max_tokens` before the closing ``` fence was emitted.
 pub fn parse_llm_analyze_output(raw: &str) -> Result<ParsedEntities, ParseError> {
-    let json_str = extract_json_block(raw).ok_or(ParseError::NoJsonFence)?;
+    let json_str = if let Some(fenced) = extract_json_block(raw) {
+        fenced
+    } else {
+        // No fence — try the recovery path. We do all the work on
+        // an owned String so the returned &str borrow is tied to a
+        // local owned value (the `?` short-circuits if None).
+        let stripped = strip_think_blocks(raw);
+        find_raw_sdef_object(&stripped).ok_or(ParseError::NoJsonFence)?
+    };
     let value: serde_json::Value = serde_json::from_str(json_str)?;
     let obj = value
         .as_object()
