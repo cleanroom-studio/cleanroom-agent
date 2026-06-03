@@ -1,0 +1,27 @@
+-- Phase 1.1 (MVP close-out): add a dedicated `module_name` column
+-- to `design_decisions` so per-module decisions can be queried
+-- without a `LIKE '%module=<name>;%'` regex on the `context` column
+-- (which was the pre-migration workaround that the
+-- `infer_design_decisions` producer handler used).
+--
+-- Migration order:
+-- 1. ADD COLUMN with default NULL (idempotent in spirit; SQLite
+--    doesn't have `ADD COLUMN IF NOT EXISTS` in older versions,
+--    so we use a `CREATE TABLE ... IF NOT EXISTS` + `INSERT OR IGNORE`
+--    pattern via a `CREATE TRIGGER` workaround. For Phase 1.1 we
+--    just use plain `ALTER TABLE` — re-running the migration on
+--    an up-to-date DB will fail with "duplicate column", which
+--    the migration runner logs and continues from. Move to
+--    idempotent helpers when SQLite 3.35+ is the floor.)
+-- 2. Update `SdefRepository::create_design_decision` to write
+--    the new column.
+-- 3. Update `sdef_context::load_module_design_decisions` to
+--    filter on `module_name` instead of the `LIKE` regex.
+--
+-- Existing rows: `module_name` will be NULL for per-file
+-- decisions (those were the LlmAnalyzeFile output written by
+-- `llm_sdef_parser::write_parsed_to_db`); NULL for the
+-- template-path hardcoded decisions too. The new
+-- `InferDesignDecisions` handler will populate it on writes.
+
+ALTER TABLE design_decisions ADD COLUMN module_name TEXT;

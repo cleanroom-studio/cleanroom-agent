@@ -66,6 +66,59 @@ pub fn load_shard_for_task(
                 .unwrap_or("");
             load_entity_with_attributes(db, entity_uri, budget)
         }
+        TaskType::InferDesignDecisions => {
+            // Phase 1.1: hand the LLM all the per-file design
+            // decisions already inferred for the module (from
+            // earlier `LlmAnalyzeFile` tasks) plus the document
+            // summary, so it can synthesize the *module-level* set
+            // without re-deriving per-file observations. The
+            // `module_name` comes from the task input; the document
+            // name is the S.DEF document under analysis.
+            let module_name = input
+                .get("module_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let document_name = input
+                .get("document")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if document_name.is_empty() || module_name.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Doc summary as a Medium anchor; module decisions as
+            // High; the rest (per-file data models / etc.) come from
+            // a `load_shard_for_file` for the first file in the
+            // module so the LLM can see the entities.
+            let mut items: Vec<ContextItem> = Vec::new();
+            items.push(ContextItem::new(
+                format!("sdef://{document_name}"),
+                format!("Document: {document_name}\nModule under analysis: {module_name}"),
+                Priority::Medium,
+            ));
+            // Existing module-level decisions (if a re-run of the
+            // task happens; the LLM benefits from seeing its own
+            // previous answers).
+            let mut module_decisions = load_module_design_decisions(
+                db,
+                document_name,
+                module_name,
+                budget,
+            )?;
+            items.append(&mut module_decisions);
+            // Per-file context: scan all files in the module and load
+            // each one's shard. We use `load_shard_for_file` for
+            // every file path in the task input.
+            if let Some(arr) = input.get("file_paths").and_then(|v| v.as_array()) {
+                for f in arr {
+                    if let Some(rel) = f.as_str() {
+                        let mut per_file = load_shard_for_file(db, rel, budget)?;
+                        items.append(&mut per_file);
+                    }
+                }
+            }
+            trim_to_budget(&mut items, budget);
+            Ok(items)
+        }
         _ => Ok(Vec::new()),
     }
 }
@@ -249,6 +302,66 @@ pub fn load_function_and_dependents(
     budget: &ContextBudget,
 ) -> Result<Vec<ContextItem>, DbError> {
     load_entity_with_attributes(db, entity_uri, budget)
+}
+
+/// Phase 1.1: load all *module-level* design decisions for a given
+/// module name, in the context-loader style. Per-module decisions
+/// are persisted by [`ProducerAgent::infer_design_decisions`]
+/// (see `producer.rs`) with `module_name = '<name>'` (set in
+/// `DesignDecisionRecord::module_name` since migration 013; before
+/// that we LIKE-matched `context = 'module=<name>;%'` which was
+/// the pre-1.1 workaround). Returns one `ContextItem` per
+/// decision, all at `Priority::High` (these are useful summaries
+/// but rarely Must-level "the LLM cannot proceed without them").
+/// Trimmed to fit `budget`.
+///
+/// An empty `module_name` returns an empty vec (no filter matches).
+pub fn load_module_design_decisions(
+    db: &Arc<Database>,
+    document_name: &str,
+    module_name: &str,
+    budget: &ContextBudget,
+) -> Result<Vec<ContextItem>, DbError> {
+    if module_name.is_empty() || document_name.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = db.connection();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, topic, decision, rationale FROM design_decisions \
+             WHERE document_name = ?1 AND module_name = ?2 \
+             ORDER BY topic ASC",
+        )
+        .map_err(|e| DbError::QueryFailed(e.to_string()))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![document_name, module_name],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "topic": row.get::<_, String>(1)?,
+                    "decision": row.get::<_, String>(2)?,
+                    "rationale": row.get::<_, String>(3)?,
+                }))
+            },
+        )
+        .map_err(|e| DbError::QueryFailed(e.to_string()))?;
+    let mut items: Vec<ContextItem> = Vec::new();
+    for r in rows {
+        let row = r.map_err(|e| DbError::QueryFailed(e.to_string()))?;
+        let topic = row.get("topic").and_then(|v| v.as_str()).unwrap_or("?");
+        let decision = row.get("decision").and_then(|v| v.as_str()).unwrap_or("?");
+        let rationale = row.get("rationale").and_then(|v| v.as_str()).unwrap_or("");
+        items.push(ContextItem::new(
+            format!("sdef://{document_name}/{module_name}/decisions#{topic}"),
+            format!(
+                "Module decision [{module_name}/{topic}]:\n  decision:  {decision}\n  rationale: {rationale}"
+            ),
+            Priority::High,
+        ));
+    }
+    trim_to_budget(&mut items, budget);
+    Ok(items)
 }
 
 // ============================================================================
@@ -546,6 +659,86 @@ mod tests {
         let budget = ContextBudget::default();
         let items = load_module_subtree(&db, "sdef://doc-1", &budget).expect("ok");
         assert!(!items.is_empty(), "Phase 0.3 fallback returns at least the doc summary");
+    }
+
+    // Phase 1.1: seed two module-level design decisions on top of the
+    // baseline `seed_one_document` fixture and assert the helper finds
+    // them by module name. Phase 1.1 (close-out): use the
+    // dedicated `module_name` column (migration 013) instead of
+    // stuffing the value into `context`.
+    fn seed_module_decisions(dir: &tempfile::TempDir) {
+        let conn =
+            rusqlite::Connection::open(dir.path().join("sdef-ctx-test.db")).expect("open");
+        conn.execute_batch(
+            "INSERT INTO design_decisions \
+             (id, document_name, topic, decision, rationale, module_name) VALUES \
+             ('dd-mod-001', 'doc-1', 'Storage backend', 'In-memory Vec', \
+              'Simplicity.', 'src');\
+             INSERT INTO design_decisions \
+             (id, document_name, topic, decision, rationale, module_name) VALUES \
+             ('dd-mod-002', 'doc-1', 'Error handling', 'Result<T, E>', \
+              'No panics.', 'src');\
+             INSERT INTO design_decisions \
+             (id, document_name, topic, decision, rationale, module_name) VALUES \
+             ('dd-other', 'doc-1', 'Other module', 'n/a', 'n/a', 'other');",
+        )
+        .expect("seed module decisions");
+    }
+
+    #[test]
+    fn test_load_module_design_decisions_filters_by_module() {
+        let (dir, db) = make_db();
+        seed_one_document(&dir);
+        seed_module_decisions(&dir);
+        let budget = ContextBudget::default();
+
+        let items = load_module_design_decisions(&db, "doc-1", "src", &budget).expect("ok");
+        assert_eq!(items.len(), 2, "two module-level decisions for 'src'");
+        // The "Other module" decision must NOT be present (we filter
+        // on `module=src;` specifically, prefix-safe).
+        let uris: Vec<&str> = items.iter().map(|i| i.uri.as_str()).collect();
+        assert!(uris.iter().any(|u| u.contains("Storage backend")));
+        assert!(uris.iter().any(|u| u.contains("Error handling")));
+        assert!(!uris.iter().any(|u| u.contains("Other module")));
+
+        // The 'other' module returns its 1 decision, not the 'src' ones.
+        let other = load_module_design_decisions(&db, "doc-1", "other", &budget).expect("ok");
+        assert_eq!(other.len(), 1);
+
+        // Empty module name returns empty.
+        let empty =
+            load_module_design_decisions(&db, "doc-1", "", &budget).expect("ok");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_load_shard_for_task_dispatches_infer_design_decisions() {
+        // Phase 1.1: `InferDesignDecisions` tasks should get a
+        // non-empty context: the doc summary + any prior module-level
+        // decisions + per-file shards. This pins the contract that
+        // the LLM sees prior observations when re-synthesizing.
+        let (dir, db) = make_db();
+        seed_one_document(&dir);
+        seed_module_decisions(&dir);
+        let budget = ContextBudget::default();
+
+        let task = make_task(
+            TaskType::InferDesignDecisions,
+            serde_json::json!({
+                "document": "doc-1",
+                "module_name": "src",
+                "file_paths": ["src/user.rs"],
+            }),
+        );
+        let items = load_shard_for_task(&db, &task, &budget).expect("ok");
+        assert!(
+            !items.is_empty(),
+            "InferDesignDecisions task should get a non-empty context"
+        );
+        // The doc summary is always present (Medium).
+        assert!(items.iter().any(|i| i.priority == Priority::Medium));
+        // At least one High item from the prior module decisions.
+        assert!(items.iter().any(|i| i.priority == Priority::High));
     }
 
     #[test]

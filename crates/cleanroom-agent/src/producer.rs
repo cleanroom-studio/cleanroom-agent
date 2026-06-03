@@ -284,6 +284,9 @@ impl ProducerAgent {
             match task.task_type {
                 TaskType::RepoAnalyze => self.analyze_repo(&task).await?,
                 TaskType::LlmAnalyzeFile => self.analyze_file_with_llm(&task).await?,
+                TaskType::InferDesignDecisions => {
+                    self.infer_design_decisions(&task).await?
+                }
                 _ => {
                     repo.complete(&task.task_id, "{}")?;
                 }
@@ -683,6 +686,320 @@ impl ProducerAgent {
         }
     }
 
+    /// Phase 1.1 (`InferDesignDecisions` task type): ask the LLM to
+    /// infer 3-10 *module-level* design decisions for a Rust source
+    /// module and persist them to the `design_decisions` table.
+    ///
+    /// # What this adds over Phase 0.5
+    ///
+    /// The Phase 0.5 `LlmAnalyzeFile` path records per-file design
+    /// decisions (e.g. "this file uses a `Vec` for storage"). Those
+    /// are leaf-level observations; they don't tell you *why* the
+    /// module is structured the way it is. `InferDesignDecisions` is
+    /// a *second LLM pass* at the module level that summarizes the
+    /// cross-cutting choices the LLM sees in the code: error-handling
+    /// convention, storage strategy, public-API surface, concurrency
+    /// posture, etc.
+    ///
+    /// # Storage convention (Phase 1.1 MVP)
+    ///
+    /// For now we reuse the existing `design_decisions` table — no
+    /// migration. The module name is encoded in the `context` field
+    /// as a `module=<name>` prefix so `sdef_context`'s
+    /// `load_module_design_decisions` can filter by module later. (A
+    /// future migration will add a dedicated `module_name` column.)
+    ///
+    /// # Task input shape
+    ///
+    /// ```json
+    /// {
+    ///   "document": "<sdef doc name>",
+    ///   "module_name": "<rust module / dir, e.g. 'src'>",
+    ///   "file_paths": ["src/user.rs", "src/lib.rs"],
+    ///   "repo_path": "/abs/path/to/repo"
+    /// }
+    /// ```
+    ///
+    /// # Requires
+    ///
+    /// - `self.llm` set (use `.with_llm(...)` at construction time)
+    /// - `self.db` pointing at a fully-migrated SQLite
+    pub async fn infer_design_decisions(&self, task: &Task) -> Result<(), DbError> {
+        let llm = self.llm.as_ref().ok_or_else(|| {
+            DbError::QueryFailed(
+                "InferDesignDecisions task claimed but no LLM is attached. \
+                 Construct the producer with `.with_llm(...)` to enable this path."
+                    .to_string(),
+            )
+        })?;
+
+        // 1. Parse task input.
+        let input: serde_json::Value = serde_json::from_str(&task.input_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let repo_path = input
+            .get("repo_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        let module_name = input
+            .get("module_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                DbError::QueryFailed(
+                    "InferDesignDecisions task missing input.module_name".to_string(),
+                )
+            })?
+            .to_string();
+        let file_paths: Vec<String> = input
+            .get("file_paths")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let document = input
+            .get("document")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string();
+
+        // 2. Read the source files. Skip silently if any are missing
+        //    (the LLM still gets the rest). The LLM sees a numbered
+        //    listing so it can reference file paths in its rationale.
+        let mut source_sections: Vec<String> = Vec::new();
+        for (i, rel) in file_paths.iter().enumerate() {
+            let full = std::path::Path::new(repo_path).join(rel);
+            match std::fs::read_to_string(&full) {
+                Ok(s) => {
+                    if !s.trim().is_empty() {
+                        source_sections
+                            .push(format!("--- file #{i}: {rel} ---\n```rust\n{s}\n```"));
+                    } else {
+                        source_sections
+                            .push(format!("--- file #{i}: {rel} ---\n(empty file, skipped)"));
+                    }
+                }
+                Err(e) => source_sections
+                    .push(format!("--- file #{i}: {rel} ---\n(read failed: {e})")),
+            }
+        }
+        if source_sections.is_empty() {
+            warn!(
+                task_id = %task.task_id,
+                module = %module_name,
+                "infer_design_decisions: no source files read; aborting task"
+            );
+            let repo = TaskRepository::new(self.db.connection_arc());
+            let output = serde_json::json!({
+                "module_name": module_name,
+                "document": document,
+                "skipped": true,
+                "reason": "no source files readable",
+            });
+            repo.complete(&task.task_id, &serde_json::to_string(&output).unwrap_or_default())?;
+            return Ok(());
+        }
+
+        // 3. Build the system + user prompts (Phase 1.1 module-level).
+        let system_prompt =
+            build_infer_design_decisions_system_prompt(&document, &module_name);
+        let sources = source_sections.join("\n\n");
+        let user_message = format!(
+            "Infer 3-10 module-level design decisions for the Rust module below. \
+             Wrap your JSON between ```json ... ``` fences so the parser can extract it. \
+             Do not include commentary outside the JSON fences.\n\n\
+             Module: {module_name}\nDocument: {document}\nFiles: {}\n\n{sources}",
+            file_paths.len()
+        );
+
+        // 4. Call the LLM via the same `run_loop` path
+        //    `analyze_file_with_llm` uses (Phase 0.9 audit hook
+        //    wired the same way; Phase 0.10 tools/memory forward
+        //    forward). We share the `loop_config` and `llm_call_logger`
+        //    plumbing with the rest of the producer.
+        let mut loop_cfg = self.loop_config.clone();
+        loop_cfg.tools = self.tools.clone();
+        loop_cfg.memory = self.memory_config;
+        if let Some(logger) = self.llm_call_logger.clone() {
+            loop_cfg.on_call_complete = Some(Arc::new(move |log: cleanroom_db::LlmCallLog| {
+                if let Err(e) = logger.create(&log) {
+                    tracing::warn!(
+                        error = %e,
+                        call_id = %log.call_id,
+                        "llm_call_log: failed to persist LlmCallLog"
+                    );
+                }
+            }));
+        }
+        let model_name = std::env::var("EVAL_MODEL")
+            .unwrap_or_else(|_| "unknown".to_string());
+        let ctx = LoopContext::new(
+            "infer-design-decisions",
+            "producer-llm-session",
+            "cleanroom-producer",
+            system_prompt,
+            user_message,
+        )
+        .with_model(model_name)
+        .with_memory_opt(self.memory.clone());
+        let outcome = run_loop(llm.clone(), ctx, &loop_cfg)
+            .await
+            .map_err(|e| DbError::QueryFailed(format!("LLM call failed: {e}")))?;
+
+        // 5. Parse + persist. We reuse `parse_llm_analyze_output`
+        //    (it already extracts `{design_decisions: [...]}`) and
+        //    `write_parsed_to_db` (it already writes design decisions
+        //    to the right table). Phase 1.1 MVP doesn't add a new
+        //    field to `DesignDecisionRecord`; we encode the module
+        //    name in the `context` field as `module=<name>; ...`.
+        let repo = TaskRepository::new(self.db.connection_arc());
+        let outcome = match outcome {
+            LoopOutcome::Done { result, prompt_tokens, completion_tokens, .. } => {
+                let sdef_repo = cleanroom_db::SdefRepository::new_with_arc(
+                    self.db.connection_arc(),
+                );
+                // 5a. Phase 1.1 (closed 2026-06-02): `design_decisions`
+                //     has a `FOREIGN KEY (document_name) REFERENCES
+                //     sdef_documents(name)` constraint (migration 001
+                //     L:320). We must upsert the S.DEF document row
+                //     first — otherwise the per-decision `INSERT` blows
+                //     up with `FOREIGN KEY constraint failed` and we
+                //     silently drop the LLM's output (the example
+                //     hit this on 2026-06-02T11:28). Mirrors what
+                //     `llm_sdef_parser::write_parsed_to_db` does for
+                //     the `LlmAnalyzeFile` path. Idempotent — safe to
+                //     re-call.
+                if let Err(e) = sdef_repo.upsert_document(
+                    &cleanroom_db::repositories::sdef_repository::SdefDocument {
+                        name: document.clone(),
+                        version: None,
+                        description: Some(format!(
+                            "Module-level design decisions for module '{module_name}' \
+                             (inferred by LLM via InferDesignDecisions task)"
+                        )),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                ) {
+                    warn!(
+                        task_id = %task.task_id,
+                        document = %document,
+                        error = %e,
+                        "infer_design_decisions: sdef_documents upsert failed; \
+                         per-decision INSERTs will fail too"
+                    );
+                }
+                let mut count = 0;
+                let parse_status = match parse_llm_analyze_output(&result) {
+                    Ok(entities) => {
+                        for dd in &entities.design_decisions {
+                            // Build a `DesignDecisionRecord` directly so
+                            // we can stuff the module name into `context`.
+                            // `write_parsed_to_db` doesn't expose the
+                            // module hook yet, so this is the
+                            // closest path until we add a
+                            // `module_name` column.
+                            let id = format!("dd-mod-{}", uuid::Uuid::new_v4());
+                            let decision_text = dd
+                                .decision
+                                .clone()
+                                .or_else(|| dd.description.clone())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "(no decision recorded)".to_string());
+                            let rationale = dd
+                                .rationale
+                                .clone()
+                                .or_else(|| dd.description.clone())
+                                .unwrap_or_default();
+                            let topic = dd
+                                .topic
+                                .clone()
+                                .unwrap_or_else(|| "unspecified".to_string());
+                            let context = format!("module={module_name}; phase=1.1");
+                            if let Err(e) = sdef_repo.create_design_decision(
+                                &cleanroom_db::repositories::sdef_repository::DesignDecisionRecord {
+                                    id,
+                                    document_name: document.clone(),
+                                    topic,
+                                    decision: decision_text,
+                                    rationale,
+                                    // Phase 1.1: the whole point of
+                                    // the migration 013 column is
+                                    // to query module-level
+                                    // decisions cleanly. Set the
+                                    // column instead of stuffing
+                                    // `module=<name>` into the
+                                    // `context` field (we still
+                                    // keep the `phase=1.1` marker
+                                    // in `context` for human
+                                    // readers).
+                                    module_name: Some(module_name.clone()),
+                                    context: Some(context),
+                                    alternatives_json: None,
+                                    consequences_json: None,
+                                },
+                            ) {
+                                warn!(
+                                    task_id = %task.task_id,
+                                    module = %module_name,
+                                    error = %e,
+                                    "infer_design_decisions: DB write failed"
+                                );
+                            } else {
+                                count += 1;
+                            }
+                        }
+                        info!(
+                            task_id = %task.task_id,
+                            module = %module_name,
+                            count,
+                            "InferDesignDecisions: persisted module-level design decisions"
+                        );
+                        ("sdef-output/v0.1", count)
+                    }
+                    Err(e) => {
+                        warn!(
+                            task_id = %task.task_id,
+                            module = %module_name,
+                            error = %e,
+                            "InferDesignDecisions: LLM output could not be parsed"
+                        );
+                        ("sdef-output/v0.1 (parse failed)", 0_usize)
+                    }
+                };
+                let output = serde_json::json!({
+                    "module_name": module_name,
+                    "document": document,
+                    "raw_llm_output": result,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "parser": parse_status.0,
+                    "design_decision_count": parse_status.1,
+                });
+                repo.complete(&task.task_id, &serde_json::to_string(&output).unwrap_or_default())?;
+                info!(
+                    task_id = %task.task_id,
+                    module = %module_name,
+                    prompt = prompt_tokens,
+                    completion = completion_tokens,
+                    "InferDesignDecisions task completed"
+                );
+                Ok(())
+            }
+            LoopOutcome::Aborted { reason, .. } => Err(DbError::QueryFailed(format!(
+                "InferDesignDecisions aborted: {reason}"
+            ))),
+            LoopOutcome::MaxIter { last_text, .. } => Err(DbError::QueryFailed(format!(
+                "InferDesignDecisions hit max iterations; last text: {last_text}"
+            ))),
+            LoopOutcome::LlmRefused { reason, .. } => Err(DbError::QueryFailed(format!(
+                "InferDesignDecisions refused: {reason}"
+            ))),
+        };
+        outcome
+    }
+
     /// Send heartbeat for current task.
     pub async fn heartbeat(&self, task_id: &str) -> Result<(), DbError> {
         let repo = TaskRepository::new(self.db.connection_arc());
@@ -811,6 +1128,54 @@ fn build_llm_analyze_file_system_prompt(document: &str, file_path: &str) -> Stri
     )
 }
 
+/// Phase 1.1: build the system prompt for an `InferDesignDecisions`
+/// task. The LLM is asked to look at a whole Rust module (a few
+/// files worth of source) and emit *module-level* design decisions
+/// (e.g. "Error handling uses `Result` throughout, no panics") —
+/// as opposed to the per-file decisions that the Phase 0.5
+/// `LlmAnalyzeFile` path produces. The output schema is a strict
+/// subset of the `sdef_output` shape: only `design_decisions[]`
+/// is meaningful; the writer ignores other sections.
+fn build_infer_design_decisions_system_prompt(document: &str, module_name: &str) -> String {
+    format!(
+        "You are a senior software architect in the Cleanroom pipeline. Your job: take the \
+         source code in the user message (a *module* worth of Rust) and infer 3 to 10 \
+         *module-level* design decisions — the cross-cutting choices that explain WHY this \
+         module is structured the way it is (storage strategy, error-handling convention, \
+         API surface, concurrency posture, naming, etc.).\n\
+         \n\
+         Project: {document}\n\
+         Module: {module_name}\n\
+         \n\
+         What NOT to emit (those are per-file observations, not module decisions):\n\
+         - \"This file declares struct User\" — that's an entity, not a decision.\n\
+         - \"This trait has 2 methods\" — that's an interface, not a decision.\n\
+         - \"The function does X\" — that's a function spec, not a decision.\n\
+         \n\
+         What TO emit (examples of good module-level decisions):\n\
+         - \"Storage backend: in-memory Vec\" + rationale \"simplicity for examples\".\n\
+         - \"Error handling: `Result<T, E>` with custom error enums, no panics\".\n\
+         - \"Concurrency: single-threaded; no `Send`/`Sync` bounds\".\n\
+         - \"Public API surface: minimal — only the `UserStore` trait is re-exported\".\n\
+         \n\
+         Schema (emit ONLY this; other sections are ignored):\n\
+         ```json\n\
+         {{\n\
+           \"design_decisions\": [\n\
+             {{\"topic\": \"<short label>\", \"decision\": \"<the chosen approach>\", \
+               \"rationale\": \"<why, 1-2 sentences>\"}}\n\
+           ]\n\
+         }}\n\
+         ```\n\
+         \n\
+         Rules:\n\
+         - Emit 3 to 10 design decisions. Fewer is fine if the module is trivial.\n\
+         - Each `decision` is a concise phrase (≤ 10 words). The `rationale` does the talking.\n\
+         - If a topic doesn't apply, omit it — don't fabricate.\n\
+         - Emit only valid JSON. No prose outside the JSON fences.\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +1203,28 @@ mod tests {
         assert!(prompt.contains("my-proj"), "document name missing");
         assert!(prompt.contains("src/foo.rs"), "file path missing");
         assert!(prompt.contains("S.DEF"), "should mention S.DEF");
+    }
+
+    // Phase 1.1: `InferDesignDecisions` task type prompt.
+    #[test]
+    fn test_infer_design_decisions_system_prompt_includes_module_and_doc() {
+        let prompt = build_infer_design_decisions_system_prompt("my-proj", "src");
+        assert!(
+            prompt.contains("my-proj"),
+            "document name missing from prompt"
+        );
+        assert!(
+            prompt.contains("src"),
+            "module name missing from prompt"
+        );
+        assert!(
+            prompt.contains("design_decisions"),
+            "prompt should reference the design_decisions schema"
+        );
+        assert!(
+            prompt.contains("3-10") || prompt.contains("three to ten") || prompt.contains("3 to 10"),
+            "prompt should bound the number of decisions the LLM emits"
+        );
     }
 
     /// Path to the workspace's `migrations/` directory from this crate's
@@ -1036,9 +1423,14 @@ mod tests {
         assert_eq!(after.status, TaskStatus::Completed, "RepoAnalyze should complete");
 
         // Output should advertise the LLM mode + scheduled count.
+        // Phase 1.1: 2 source files in module "src" => 2 LlmAnalyzeFile
+        // tasks + 1 InferDesignDecisions task for the module = 3 total.
         let output: serde_json::Value = serde_json::from_str(after.output_json.as_deref().unwrap()).expect("parse");
         assert_eq!(output["mode"], "llm");
-        assert_eq!(output["scheduled_task_count"], 2, "2 source files => 2 LlmAnalyzeFile tasks");
+        assert_eq!(
+            output["scheduled_task_count"], 3,
+            "2 source files + 1 module-level reflection task"
+        );
 
         // Verify the 2 LlmAnalyzeFile tasks are in the queue, Pending, with
         // the correct input shape.
@@ -1120,6 +1512,11 @@ mod tests {
         let output: serde_json::Value = serde_json::from_str(after.output_json.as_deref().unwrap()).expect("parse");
         // LLM phase runs second and writes its summary last.
         assert_eq!(output["mode"], "llm");
-        assert_eq!(output["scheduled_task_count"], 1, "1 source file => 1 LLM task");
+        // Phase 1.1: 1 source file in module "src" => 1 LlmAnalyzeFile
+        // task + 1 InferDesignDecisions task for the module = 2 total.
+        assert_eq!(
+            output["scheduled_task_count"], 2,
+            "1 source file + 1 module-level reflection task"
+        );
     }
 }

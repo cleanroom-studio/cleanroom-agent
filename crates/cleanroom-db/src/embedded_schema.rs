@@ -18,3 +18,13 @@ pub const LLM_CALL_LOG_SCHEMA_SQL: &str = include_str!("../../../migrations/008_
 /// appended here.
 pub const LLM_CALL_LOG_MEMORY_SCHEMA_SQL: &str =
     include_str!("../../../migrations/009_llm_call_log_memory.sql");
+
+/// Phase 1.1 (close-out): add `module_name` column to
+/// `design_decisions` so per-module decisions can be queried
+/// cleanly (without the pre-1.1 `context LIKE 'module=<name>;%'`
+/// regex workaround). Production DBs apply this via
+/// `migrations::run_pending_at` from
+/// `013_design_decisions_module_name.sql`; in-memory test DBs
+/// get it appended here.
+pub const DESIGN_DECISIONS_MODULE_NAME_SCHEMA_SQL: &str =
+    include_str!("../../../migrations/013_design_decisions_module_name.sql");

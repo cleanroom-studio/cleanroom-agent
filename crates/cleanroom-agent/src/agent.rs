@@ -45,7 +45,7 @@ use cleanroom_prompt::{
 };
 use tracing::{info, instrument};
 
-use crate::consumer::{ConsumerAgent, ConsumerConfig, CompatibilityMode, Fidelity};
+use crate::consumer::{ConsumerAgent, ConsumerConfig, CompatibilityMode, ConsumeScope, Fidelity};
 use crate::llm_loop::LoopConfig;
 use crate::orchestrator::{Orchestrator, OrchestratorConfig};
 use crate::producer::{ProducerAgent, ProducerConfig};
@@ -498,6 +498,8 @@ impl CleanroomAgent {
             use_legacy_template: false,
             llm: None,
             loop_config: LoopConfig::default(),
+            target_manifest: None,
+            scope: ConsumeScope::default(),
         };
         let consumer = ConsumerAgent::new(config, self.db.clone());
         consumer.generate_code().await?;

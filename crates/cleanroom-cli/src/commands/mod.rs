@@ -50,7 +50,7 @@ use clap::{Subcommand, ValueEnum};
 use cleanroom_agent::{
     AgentConfig, CleanroomAgent, RunMode,
     CompatibilityMode, Fidelity, CompletenessValidator, format_report,
-    VersionUpgradeAnalyzer,
+    VersionUpgradeAnalyzer, consumer::ConsumeScope,
     consumer::{ConsumerAgent, ConsumerConfig},
     llm_loop::LoopConfig,
     producer::{ProducerAgent, ProducerConfig, ProducerMode},
@@ -243,6 +243,23 @@ pub enum Commands {
         compat_mode: String,
         #[arg(long, default_value = "medium")]
         fidelity: String,
+        /// Phase 1.3: scope of the consume pass. `whole` (default)
+        /// translates every entity in the S.DEF; `module=<name>`
+        /// filters down to entities whose `logical_model` contains
+        /// `<name>`; `function=<name>` filters to a single
+        /// function spec. The form is one flag with a
+        /// `kind=value` payload.
+        #[arg(long, default_value = "whole")]
+        scope: String,
+        /// Phase 1.2: path to the *target* project (the codebase
+        /// the generated code will be dropped into). When given,
+        /// we read its `Cargo.toml` / `package.json` /
+        /// `pyproject.toml` and inject the inferred package name,
+        /// version, and dep set into the LLM prompt. Optional —
+        /// the LLM still works without it (it just guesses at
+        /// imports).
+        #[arg(long)]
+        target_dir: Option<String>,
         /// LLM model (e.g. gemini-2.5-flash)
         #[arg(long)]
         model: Option<String>,
@@ -751,11 +768,11 @@ pub fn run(command: Commands, db_path: &str) -> Result<()> {
         Commands::Produce { repo, output, exclude: _, name, model, api_key, mode, max_iterations, max_tokens, temperature, cost_limit_usd } => {
             produce_command(&repo, &output, db_path, name, model, api_key, mode, max_iterations, max_tokens, temperature, cost_limit_usd)
         }
-        Commands::Consume { sdef, output, language, framework, compat_mode, fidelity, model, api_key, mode, max_iterations: _, max_tokens: _, temperature: _, cost_limit_usd: _ } => {
+        Commands::Consume { sdef, output, language, framework, compat_mode, fidelity, scope, target_dir, model, api_key, mode, max_iterations: _, max_tokens: _, temperature: _, cost_limit_usd: _ } => {
             // Phase 0.8: Consume currently ignores the 4 loop-tuning
             // flags (they apply to Producer's LLM path). The `mode`
             // flag IS honored: llm / template / both.
-            consume_command(&sdef, &output, &language, framework.as_deref(), &compat_mode, &fidelity, db_path, model, api_key, mode)
+            consume_command(&sdef, &output, &language, framework.as_deref(), &compat_mode, &fidelity, &scope, &target_dir, db_path, model, api_key, mode)
         }
         Commands::Serve { transport } => {
             serve_command(&transport, db_path)
@@ -1405,10 +1422,45 @@ fn write_produce_diff_report(
 /// Handler for the `consume` command.
 ///
 /// Loads S.DEF, generates code via LLM, and validates output completeness.
+/// Parse the `--scope` CLI flag (a `kind=value` string) into a
+/// [`ConsumeScope`]. Accepts:
+/// - `"whole"`  (default) → `WholeProject`
+/// - `"module=<name>"`   → `Module(name)`
+/// - `"function=<name>"` → `Function(name)`
+///
+/// Unknown / malformed values fall back to `WholeProject` with a
+/// `tracing::warn!` so the consume pass still runs.
+fn parse_consume_scope(s: &str) -> ConsumeScope {
+    let s = s.trim();
+    if s.is_empty() || s == "whole" {
+        return ConsumeScope::WholeProject;
+    }
+    if let Some(rest) = s.strip_prefix("module=") {
+        if rest.is_empty() {
+            tracing::warn!("--scope 'module=' is missing a name; defaulting to WholeProject");
+            return ConsumeScope::WholeProject;
+        }
+        return ConsumeScope::Module(rest.to_string());
+    }
+    if let Some(rest) = s.strip_prefix("function=") {
+        if rest.is_empty() {
+            tracing::warn!("--scope 'function=' is missing a name; defaulting to WholeProject");
+            return ConsumeScope::WholeProject;
+        }
+        return ConsumeScope::Function(rest.to_string());
+    }
+    tracing::warn!(
+        scope = s,
+        "--scope value is not 'whole', 'module=<name>', or 'function=<name>'; \
+         defaulting to WholeProject"
+    );
+    ConsumeScope::WholeProject
+}
+
 fn consume_command(
     sdef: &str, output: &str, language: &str, framework: Option<&str>,
-    compat_mode: &str, fidelity: &str, db_path: &str,
-    model: Option<String>, api_key: Option<String>,
+    compat_mode: &str, fidelity: &str, scope: &str, target_dir: &Option<String>,
+    db_path: &str, model: Option<String>, api_key: Option<String>,
     mode: CliMode,
 ) -> Result<()> {
     set_api_key(api_key.clone());
@@ -1456,6 +1508,25 @@ fn consume_command(
             Some(&cli_migrations_dir()),
         )?);
         let use_legacy_template = matches!(mode, CliMode::Template);
+        // Phase 1.3: parse the `--scope` flag (`whole` | `module=<name>`
+        // | `function=<name>`) into a `ConsumeScope` enum.
+        let scope = parse_consume_scope(scope);
+        // Phase 1.2: infer the target project skeleton from
+        // `--target-dir` if the caller passed one. Falls back to
+        // "no manifest" (None) when omitted — the LLM still gets
+        // language-only context, the pre-1.2 behavior.
+        let target_manifest = target_dir.as_deref().and_then(|d| {
+            let path = std::path::Path::new(d);
+            if path.is_dir() {
+                Some(cleanroom_agent::target_manifest::infer_manifest(path))
+            } else {
+                tracing::warn!(
+                    target_dir = %d,
+                    "--target-dir is not a directory; ignoring for infer_manifest"
+                );
+                None
+            }
+        });
         let consumer_config = ConsumerConfig {
             language: language.to_string(),
             framework: framework.map(|s| s.to_string()),
@@ -1465,6 +1536,8 @@ fn consume_command(
             use_legacy_template,
             llm: None,
             loop_config: LoopConfig::default(),
+            target_manifest,
+            scope,
         };
         let mut consumer = ConsumerAgent::new(consumer_config, db.clone());
         if !use_legacy_template {

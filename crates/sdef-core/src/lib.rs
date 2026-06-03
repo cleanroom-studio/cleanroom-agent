@@ -84,6 +84,22 @@ pub use types::versioning::{CompatibilityMapping, DataMigration, DeprecationInfo
 pub use version::CURRENT_SCHEMA_VERSION;
 pub use types::shard::{ShardMetadata, ShardStatus, ShardType};
 
+// UI types (re-exported at top level for ergonomics — used by cleanroom-figma
+// and the upcoming cleanroom-studio). These are Pen visual document types
+// plus S.DEF semantic extensions (sdef_bindings / sdef_behaviors / etc.).
+pub use types::ui::{
+    ResponsiveBreakpoint, UIAccessibility, UIAxisSizingMode, UIBaseElement, UIBehavior,
+    UIBehaviorOutcome, UIComponentType, UIDataBinding, UIDesignMotion, UIDesignSystem,
+    UIDesignTheme, UIDesignTypography, UIDocument, UIEllipse, UIFrame, UIIconFont,
+    UILayoutAlign, UINavTarget, UINavigation, UINode, UIPath, UIRectangle, UIRef,
+    UIScreen, UIStroke, UIText, UIVariable, UIVisualState, UIVisualStateCondition,
+    UserInterface,
+};
+pub use types::ui_figma::{
+    UIComponentProperty, UIComponentVariant, UIImportProvenance, UIImportSource,
+    UILayoutGrid, UIVariableMode,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

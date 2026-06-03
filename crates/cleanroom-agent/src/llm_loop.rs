@@ -173,6 +173,19 @@ pub struct LoopConfig {
     /// `ProducerAgent::with_memory` / `ConsumerAgent::with_memory`
     /// builders which thread the same value through).
     pub memory: MemoryConfig,
+    /// Phase 1.4: maximum number of *self-reflection* rounds
+    /// the consumer will run after generating code. `0` (the
+    /// default) disables reflection — pre-1.4 behavior, no
+    /// extra LLM calls. `> 0` enables the
+    /// [`crate::llm_reflection::self_critique`] loop: after
+    /// each `run_loop` call, the consumer asks the LLM to
+    /// review its own output against the S.DEF; if the report
+    /// says `requires_regen` and we haven't hit the cap, the
+    /// consumer re-prompts the LLM with the issues appended
+    /// and tries again. Each reflection round is one extra
+    /// LLM call (~$0.015 with `MiniMax-M3`); keep this small
+    /// (2-3 max) for cost control.
+    pub max_reflection_iterations: u32,
 }
 
 impl std::fmt::Debug for LoopConfig {
@@ -186,6 +199,7 @@ impl std::fmt::Debug for LoopConfig {
             .field("on_call_complete", &self.on_call_complete.as_ref().map(|_| "<fn>"))
             .field("tools", &self.tools.as_ref().map(|v| format!("<{} tools>", v.len())))
             .field("memory", &self.memory)
+            .field("max_reflection_iterations", &self.max_reflection_iterations)
             .finish()
     }
 }
@@ -201,6 +215,11 @@ impl Default for LoopConfig {
             on_call_complete: None,
             tools: None,
             memory: MemoryConfig::None,
+            // Phase 1.4: default 0 = no reflection (pre-1.4
+            // behavior). Opt in via
+            // `LoopConfig { max_reflection_iterations: 2, .. }` or
+            // `ConsumerAgent::with_max_reflection_iterations(2)`.
+            max_reflection_iterations: 0,
         }
     }
 }

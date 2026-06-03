@@ -190,6 +190,9 @@ pub struct UIBaseElement {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
+    /// S.DEF / Pen type discriminator. Renamed to `"type"` in the wire
+    /// format (Rust's `type` is a keyword, so we use `type_` internally).
+    #[serde(rename = "type")]
     pub type_: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -460,6 +463,32 @@ pub struct UIText {
 }
 
 /// Union type for all visual nodes.
+///
+/// Discriminated by the top-level `type_` field (which comes from
+/// `UIBaseElement.type_` via `#[serde(flatten)]`). Possible values:
+///
+/// | `type_`       | Variant            |
+/// |---------------|--------------------|
+/// | `"frame"`     | [`Self::Frame`]      |
+/// | `"text"`      | [`Self::Text`]       |
+/// | `"rectangle"` | [`Self::Rectangle`]  |
+/// | `"ellipse"`   | [`Self::Ellipse`]    |
+/// | `"path"`      | [`Self::Path`]       |
+/// | `"ref"`       | [`Self::Ref`]        |
+/// | `"icon_font"` | [`Self::IconFont`]   |
+/// | (other)       | [`Self::Base`]      |
+///
+/// **Deserialization note**: We can't use `#[serde(untagged)]` directly
+/// because all variants have a `flatten`ed `base` field with the type
+/// discriminator nested inside — `untagged` tries variants in declaration
+/// order and the first variant (Frame) matches everything (all of its
+/// other fields are `Option`). The `Deserialize` impl reads the buffer
+/// twice via `serde_json::Value` to dispatch on the `type_` field, then
+/// re-serializes to the matching variant.
+///
+/// For the common case (JSON via `serde_json::from_str`), use the
+/// auto-derived behavior. For binary or non-JSON formats, use
+/// `UINode::from_value` after parsing into `serde_json::Value` first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum UINode {
@@ -471,6 +500,29 @@ pub enum UINode {
     Ref(UIRef),
     IconFont(UIIconFont),
     Base(UIBaseElement),
+}
+
+impl UINode {
+    /// Deserialize a `UINode` from a `serde_json::Value`, dispatching on
+    /// the top-level `type_` field. Use this when the standard
+    /// `Deserialize` impl (which is `untagged` and therefore ambiguous)
+    /// is not appropriate.
+    pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        let type_ = value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("base");
+        match type_ {
+            "frame" => serde_json::from_value::<UIFrame>(value).map(UINode::Frame),
+            "text" => serde_json::from_value::<UIText>(value).map(UINode::Text),
+            "rectangle" => serde_json::from_value::<UIRectangle>(value).map(UINode::Rectangle),
+            "ellipse" => serde_json::from_value::<UIEllipse>(value).map(UINode::Ellipse),
+            "path" => serde_json::from_value::<UIPath>(value).map(UINode::Path),
+            "ref" => serde_json::from_value::<UIRef>(value).map(UINode::Ref),
+            "icon_font" => serde_json::from_value::<UIIconFont>(value).map(UINode::IconFont),
+            _ => serde_json::from_value::<UIBaseElement>(value).map(UINode::Base),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +614,7 @@ pub struct UIScreen {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UIComponent {
     pub name: String,
+    #[serde(rename = "type")]
     pub type_: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]

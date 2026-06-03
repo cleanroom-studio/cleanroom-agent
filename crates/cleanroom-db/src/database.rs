@@ -203,6 +203,13 @@ impl Database {
         // migrations directory.
         conn.execute_batch(crate::embedded_schema::LLM_CALL_LOG_MEMORY_SCHEMA_SQL)
             .map_err(|e| DbError::MigrationFailed(e.to_string()))?;
+        // Phase 1.1 (close-out): also apply the `module_name` column
+        // on `design_decisions` (migration 013). Same rationale as
+        // the LLM call log inlines above — production paths use
+        // `run_pending_at`; the in-memory factory inlines the SQL
+        // so unit tests don't need a migrations directory.
+        conn.execute_batch(crate::embedded_schema::DESIGN_DECISIONS_MODULE_NAME_SCHEMA_SQL)
+            .map_err(|e| DbError::MigrationFailed(e.to_string()))?;
         drop(conn);
         Ok(db)
     }

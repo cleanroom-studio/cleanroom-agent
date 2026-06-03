@@ -261,6 +261,27 @@ impl TaskPlan {
     /// `file_paths` should be repo-relative (e.g. `"src/main.rs"`). The full
     /// repo path is sent in `input["repo_path"]` so the worker can resolve
     /// the file on disk.
+    ///
+    /// # Phase 1.1 MVP
+    ///
+    /// Emits **two** priority groups:
+    ///
+    /// 1. Group 0 (priority 8): one `LlmAnalyzeFile` task per file
+    ///    — runs first, in parallel.
+    /// 2. Group 1 (priority 5, lower = later): one
+    ///    `InferDesignDecisions` task *per module* — runs after the
+    ///    file-analysis tasks in that module complete. "Module" is
+    ///    defined as the first path component (e.g. `src/main.rs`
+    ///    and `src/api/bar.rs` are both in module `src`). Files at
+    ///    the repo root with no directory component go into a
+    ///    synthetic module named `"(root)"`.
+    ///
+    /// Each `InferDesignDecisions` task's `dependency_indices`
+    /// points at the `LlmAnalyzeFile` task indices for files in
+    /// the same module, so the scheduler won't run the module
+    /// reflection until its per-file observations are in the
+    /// DB. Cross-module tasks still run in parallel (different
+    /// `InferDesignDecisions` tasks have no inter-deps).
     pub fn llm_analysis_plan(
         document_name: &str,
         repo_path: &str,
@@ -272,30 +293,78 @@ impl TaskPlan {
             "repo_path": repo_path,
         });
 
-        // One task per file, all at priority 8 (high but not critical-path).
-        // `max_retries: 2` keeps the noise low -- failed LLM calls are usually
-        // worth surfacing to a human rather than hammering the API.
-        let tasks: Vec<TaskTemplate> = file_paths
-            .iter()
-            .map(|p| TaskTemplate {
+        // Group 0: one LlmAnalyzeFile per file (priority 8).
+        // Track each file's flat-list index so the module-level
+        // tasks in group 1 can reference them via dependency_indices.
+        let mut file_tasks: Vec<TaskTemplate> = Vec::new();
+        let mut file_to_idx: HashMap<String, usize> = HashMap::new();
+        for p in file_paths {
+            let idx = file_tasks.len();
+            file_to_idx.insert((*p).to_string(), idx);
+            let mut inp = base_input.clone();
+            inp["file_path"] = serde_json::Value::String((*p).to_string());
+            file_tasks.push(TaskTemplate {
                 task_type: TaskType::LlmAnalyzeFile,
                 priority: 8,
-                input: {
-                    let mut inp = base_input.clone();
-                    inp["file_path"] = serde_json::Value::String((*p).to_string());
-                    inp
-                },
+                input: inp,
                 dependency_indices: vec![],
                 max_retries: 2,
-            })
-            .collect();
+            });
+        }
 
+        // Group 1: one InferDesignDecisions per module (priority 5
+        // — runs AFTER the file-analysis group because groups are
+        // processed in order and lower priority = later).
+        //
+        // "Module" = first path component. E.g. `src/main.rs` →
+        // module `src`; `tests/foo.rs` → module `tests`. Files at
+        // the repo root get a synthetic `"(root)"` module name
+        // (so they still get reflected on).
+        let mut module_files: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for p in file_paths {
+            let module = module_of(p);
+            module_files
+                .entry(module)
+                .or_default()
+                .push((*p).to_string());
+        }
+        let mut module_tasks: Vec<TaskTemplate> = Vec::new();
+        for (module, files) in &module_files {
+            let mut inp = base_input.clone();
+            inp["module_name"] = serde_json::Value::String(module.clone());
+            inp["file_paths"] = serde_json::Value::Array(
+                files
+                    .iter()
+                    .map(|f| serde_json::Value::String(f.clone()))
+                    .collect(),
+            );
+            // Wire deps: the flat-list indices of the per-file
+            // tasks in *this* module. The `create_from_plan`
+            // resolver turns these into `task_id` UUIDs at insert
+            // time. Cross-module tasks have empty deps.
+            let dep_indices: Vec<usize> = files
+                .iter()
+                .filter_map(|f| file_to_idx.get(f).copied())
+                .collect();
+            module_tasks.push(TaskTemplate {
+                task_type: TaskType::InferDesignDecisions,
+                priority: 5,
+                input: inp,
+                dependency_indices: dep_indices,
+                max_retries: 2,
+            });
+        }
+
+        let mut groups: Vec<Vec<TaskTemplate>> = Vec::new();
+        if !file_tasks.is_empty() {
+            groups.push(file_tasks);
+        }
+        if !module_tasks.is_empty() {
+            groups.push(module_tasks);
+        }
         Self {
-            priority_groups: if tasks.is_empty() {
-                vec![]
-            } else {
-                vec![tasks]
-            },
+            priority_groups: groups,
             document_name: document_name.to_string(),
         }
     }
@@ -554,6 +623,32 @@ pub struct ProgressSummary {
     pub total_progress: f64,
 }
 
+// =============================================================================
+// Helpers (private)
+// =============================================================================
+
+/// Phase 1.1 helper: derive a *module name* from a
+/// repo-relative file path. The module is the first path
+/// component (e.g. `src/main.rs` → `src`). Files at the repo
+/// root (no `/` in the path) get a synthetic `"(root)"`
+/// module name so they still get reflected on.
+///
+/// This is intentionally *not* the same as the file's parent
+/// directory — `src/api/bar.rs` and `src/main.rs` both go in
+/// module `src` because we want module-level reflection at
+/// the crate level, not the subdirectory level. The
+/// `infer_design_decisions` handler can always tighten this
+/// later by reading the S.DEF's module tree (Phase 5 work).
+fn module_of(file_path: &str) -> String {
+    // Use `/` as the separator; on Windows repo-relative paths
+    // are already normalized to `/` by the repo_scanner
+    // (see producer.rs L:414).
+    match file_path.find('/') {
+        Some(idx) => file_path[..idx].to_string(),
+        None => "(root)".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,13 +672,15 @@ mod tests {
     #[test]
     fn test_llm_analysis_plan_creation() {
         // No DB required: the plan generator is pure-functional, so we just
-        // exercise the priority-group shape directly.
+        // exercise the priority-group shape directly. Phase 1.1 changed
+        // the plan from 1 group (file tasks only) to 2 groups (file
+        // tasks + one per-module InferDesignDecisions task).
         let files = ["src/main.rs", "src/lib.rs", "src/config.rs"];
         let plan = TaskPlan::llm_analysis_plan("test-doc", "/tmp/repo", &files);
-        assert_eq!(plan.priority_groups.len(), 1, "all files in one priority group");
-        let group = &plan.priority_groups[0];
-        assert_eq!(group.len(), 3, "one task per file");
-        for (i, t) in group.iter().enumerate() {
+        assert_eq!(plan.priority_groups.len(), 2, "file group + module group");
+        let file_group = &plan.priority_groups[0];
+        assert_eq!(file_group.len(), 3, "one LlmAnalyzeFile task per file");
+        for (i, t) in file_group.iter().enumerate() {
             assert_eq!(t.task_type, TaskType::LlmAnalyzeFile);
             assert_eq!(t.priority, 8);
             assert_eq!(t.max_retries, 2);
@@ -595,7 +692,75 @@ mod tests {
             assert_eq!(t.input["document"], serde_json::Value::String("test-doc".into()));
             assert_eq!(t.input["repo_path"], serde_json::Value::String("/tmp/repo".into()));
         }
+        // Module group: all 3 files are in module "src", so exactly
+        // one InferDesignDecisions task with all 3 deps.
+        let module_group = &plan.priority_groups[1];
+        assert_eq!(module_group.len(), 1, "one module task for 'src'");
+        let mt = &module_group[0];
+        assert_eq!(mt.task_type, TaskType::InferDesignDecisions);
+        assert_eq!(mt.priority, 5);
+        assert_eq!(mt.input["module_name"], serde_json::Value::String("src".into()));
+        assert_eq!(mt.input["file_paths"], serde_json::json!(files));
+        assert_eq!(
+            mt.dependency_indices,
+            vec![0, 1, 2],
+            "module task must depend on all 3 file tasks"
+        );
         assert_eq!(plan.document_name, "test-doc");
+    }
+
+    #[test]
+    fn test_llm_analysis_plan_splits_by_module() {
+        // Files in 3 different modules → 3 InferDesignDecisions
+        // tasks, each with the right subset of deps.
+        let files = [
+            "src/main.rs",
+            "src/lib.rs",
+            "tests/foo.rs",
+            "tests/bar.rs",
+            "examples/hello.rs",
+        ];
+        let plan = TaskPlan::llm_analysis_plan("d", "/r", &files);
+        assert_eq!(plan.priority_groups.len(), 2);
+        assert_eq!(plan.priority_groups[0].len(), 5, "5 LlmAnalyzeFile tasks");
+        assert_eq!(plan.priority_groups[1].len(), 3, "3 module tasks: src, tests, examples");
+
+        // Module group: each module's task must have its own
+        // file-set as deps (no cross-module deps).
+        let module_tasks = &plan.priority_groups[1];
+        let mut seen_modules: std::collections::HashSet<String> = Default::default();
+        for mt in module_tasks {
+            let name = mt.input["module_name"].as_str().unwrap().to_string();
+            assert!(seen_modules.insert(name.clone()), "module {name} duplicated");
+            // dep_indices must reference positions in the
+            // *file* group's flat list (positions 0..5). Find
+            // which file_paths belong to this module and check
+            // they match.
+            let file_paths: Vec<String> = mt.input["file_paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            let expected_dep_indices: Vec<usize> = file_paths
+                .iter()
+                .map(|p| files.iter().position(|f| f == p).unwrap())
+                .collect();
+            assert_eq!(mt.dependency_indices, expected_dep_indices);
+        }
+    }
+
+    #[test]
+    fn test_module_of_helper() {
+        // Pure-function unit test for the private module-of helper.
+        // (We test it through `llm_analysis_plan` outputs above, but
+        // pinning it here too so future refactors of the heuristic
+        // don't silently break the LLM prompt contract.)
+        assert_eq!(module_of("src/main.rs"), "src");
+        assert_eq!(module_of("src/api/bar.rs"), "src");
+        assert_eq!(module_of("tests/foo.rs"), "tests");
+        assert_eq!(module_of("Cargo.toml"), "(root)");
+        assert_eq!(module_of(""), "(root)");
     }
 
     #[test]

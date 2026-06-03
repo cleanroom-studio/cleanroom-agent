@@ -95,6 +95,15 @@ pub struct DesignDecisionRecord {
     pub decision: String,
     pub rationale: String,
     pub context: Option<String>,
+    /// Phase 1.1: optional module name. NULL for per-file
+    /// decisions (those come from `LlmAnalyzeFile` and are
+    /// written by `llm_sdef_parser::write_parsed_to_db`,
+    /// which doesn't know about modules). Set to the module
+    /// name (e.g. `"src"`, `"tests"`, `"(root)"`) for
+    /// per-module decisions written by
+    /// `ProducerAgent::infer_design_decisions`. Indexed
+    /// implicitly via `sdef_context::load_module_design_decisions`.
+    pub module_name: Option<String>,
     pub alternatives_json: Option<String>,
     pub consequences_json: Option<String>,
 }
@@ -582,8 +591,8 @@ impl SdefRepository {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             r#"INSERT INTO design_decisions
-               (id, document_name, topic, decision, rationale, context, alternatives_json, consequences_json)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+               (id, document_name, topic, decision, rationale, context, module_name, alternatives_json, consequences_json)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
             params![
                 dd.id,
                 dd.document_name,
@@ -591,6 +600,7 @@ impl SdefRepository {
                 dd.decision,
                 dd.rationale,
                 dd.context,
+                dd.module_name,
                 dd.alternatives_json,
                 dd.consequences_json,
             ],

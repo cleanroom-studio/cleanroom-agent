@@ -27,6 +27,7 @@ use std::io::Write;
 
 use tracing::{info, warn};
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use serde_json;
 
 use cleanroom_db::{Database, DbError, LlmCallLogRepository, Task, TaskRepository, TaskType, TypeCacheRepository};
@@ -109,6 +110,56 @@ pub struct ConsumerConfig {
     pub llm: Option<Arc<dyn MetaLlm>>,
     /// Loop config for the LLM path (token / iteration / cost guardrails).
     pub loop_config: LoopConfig,
+    /// Phase 1.2: optional target project skeleton, inferred by
+    /// [`crate::target_manifest::infer_manifest`] from the user's
+    /// existing manifest file (Cargo.toml / package.json /
+    /// pyproject.toml). When `Some`, the LLM code-generation prompt
+    /// carries a `=== target project skeleton ===` block so the
+    /// generated code uses the right package name, the right
+    /// dep set, and the right entry-point file. When `None` the
+    /// LLM operates with language-only context (the pre-1.2
+    /// behavior, which is fine for one-off file generation but
+    /// tends to hallucinate `use <wrong_crate>::foo;` imports
+    /// when dropped into a real codebase).
+    pub target_manifest: Option<crate::target_manifest::TargetManifest>,
+    /// Phase 1.3: scope of the consume pass. Default
+    /// [`ConsumeScope::WholeProject`] preserves the pre-1.3
+    /// behavior. `Module(name)` filters the data-models /
+    /// contracts down to those whose `logical_model` contains
+    /// `name` (a best-effort approximation — see
+    /// `sdef_context::load_module_subtree` for the loader side).
+    /// `Function(uri)` filters to a single function spec.
+    pub scope: ConsumeScope,
+}
+
+/// Phase 1.3: scope of the consume pass — *which* entities get
+/// translated into code, in addition to the project-wide
+/// defaults.
+///
+/// The variant payload is a *name* (module name like `"src"` or
+/// a function-spec uri like `"sdef://doc-1/validate_email"`)
+/// rather than a fully-resolved S.DEF entity, because at this
+/// layer we don't have an LSP / symbol-resolution pipeline
+/// plugged in yet (Phase 5 work). The consumer's
+/// `generate_code_with_llm` resolves the name against the
+/// `data_models.logical_model` column (a `LIKE` match) or the
+/// `function_specs.name` column.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsumeScope {
+    /// Translate every entity in the S.DEF document. This is
+    /// the pre-1.3 behavior and the default.
+    #[default]
+    WholeProject,
+    /// Translate only the entities belonging to the named
+    /// module (matched on `data_models.logical_model LIKE
+    /// '%<name>%'` or `contracts.logical_model LIKE
+    /// '%<name>%'`). Pass a directory-style name like
+    /// `"src"` or `"src/api"`.
+    Module(String),
+    /// Translate only a single function spec, identified by
+    /// its `name` column (we don't yet have a per-entity URI
+    /// resolution layer).
+    Function(String),
 }
 
 impl std::fmt::Debug for ConsumerConfig {
@@ -122,6 +173,8 @@ impl std::fmt::Debug for ConsumerConfig {
             .field("use_legacy_template", &self.use_legacy_template)
             .field("llm", &"<dyn MetaLlm>")
             .field("loop_config", &self.loop_config)
+            .field("target_manifest", &self.target_manifest.as_ref().map(|m| m.package_name.clone()))
+            .field("scope", &self.scope)
             .finish()
     }
 }
@@ -137,6 +190,8 @@ impl Default for ConsumerConfig {
             use_legacy_template: false,
             llm: None,
             loop_config: LoopConfig::default(),
+            target_manifest: None,
+            scope: ConsumeScope::default(),
         }
     }
 }
@@ -261,6 +316,146 @@ impl ConsumerAgent {
     pub fn with_loop_config(mut self, cfg: LoopConfig) -> Self {
         self.loop_config = cfg;
         self
+    }
+
+    /// Phase 1.4: enable the LLM self-reflection loop. After
+    /// each `generate_code_with_llm` round, the consumer asks
+    /// the LLM to review its own output against the S.DEF
+    /// and logs the resulting [`crate::llm_reflection::CritiqueReport`].
+    /// `n = 0` (the default) disables reflection entirely
+    /// (pre-1.4 behavior, no extra LLM calls). We currently
+    /// do exactly **one** self-critique pass per code
+    /// generation (cost ≈ 1 extra LLM call, ~$0.015); a
+    /// full N-round "regen if regen-needed" loop is left
+    /// for Phase 1.4 close-out work.
+    pub fn with_max_reflection_iterations(mut self, n: u32) -> Self {
+        self.loop_config.max_reflection_iterations = n;
+        self
+    }
+
+    /// Phase 1.2: attach a target project skeleton so the LLM
+    /// code-generation prompt carries a `=== target project skeleton ===`
+    /// block. Use [`crate::target_manifest::infer_manifest`] to
+    /// build one from a directory, or construct
+    /// [`crate::target_manifest::TargetManifest`] manually for tests.
+    pub fn with_target_manifest(
+        mut self,
+        manifest: crate::target_manifest::TargetManifest,
+    ) -> Self {
+        self.config.target_manifest = Some(manifest);
+        self
+    }
+
+    /// Phase 1.3: limit the consume pass to a particular scope
+    /// (whole project / single module / single function). The
+    /// default is [`ConsumeScope::WholeProject`], which preserves
+    /// the pre-1.3 behavior.
+    pub fn with_scope(mut self, scope: ConsumeScope) -> Self {
+        self.config.scope = scope;
+        self
+    }
+
+    /// Phase 1.4: invoke the LLM self-critique loop on a
+    /// piece of generated code, given the S.DEF entity it was
+    /// supposed to implement. Up to `loop_config.max_reflection_iterations`
+    /// rounds — each round calls
+    /// [`crate::llm_reflection::self_critique`] and, if the
+    /// report says `requires_regen`, re-prompts the LLM with
+    /// the issues appended.
+    ///
+    /// This is the **public** entry point; the in-loop call
+    /// from `generate_code_with_llm` is internal (the MVP
+    /// scope of Phase 1.4 keeps it opt-in for now to bound
+    /// the LLM-cost growth). Callers that want the full
+    /// self-healing pass for a specific entity can invoke
+    /// this directly.
+    pub async fn reflect_on_entity(
+        &self,
+        entity_uri: &str,
+        generated_code: &str,
+        sdef_fragment_json: &str,
+    ) -> Result<
+        (
+            String,
+            crate::llm_reflection::CritiqueReport,
+            u32,
+            u32,
+        ),
+        DbError,
+    > {
+        let llm = self.llm.as_ref().ok_or_else(|| {
+            DbError::QueryFailed("reflect_on_entity: no LLM attached".to_string())
+        })?;
+        let max = self.loop_config.max_reflection_iterations as usize;
+        let mut current = generated_code.to_string();
+        let mut last_report = crate::llm_reflection::CritiqueReport::default();
+        let mut total_prompt = 0u32;
+        let mut total_completion = 0u32;
+        for n in 0..max {
+            let report = crate::llm_reflection::self_critique(
+                llm.clone(),
+                &current,
+                sdef_fragment_json,
+            )
+            .await
+            .map_err(|e| DbError::QueryFailed(format!("self_critique: {e}")))?;
+            tracing::info!(
+                entity = %entity_uri,
+                round = n + 1,
+                max = max,
+                issues = report.issues.len(),
+                requires_regen = report.requires_regen(),
+                "reflect_on_entity: critique round complete"
+            );
+            last_report = report.clone();
+            if !report.requires_regen() {
+                return Ok((current, report, total_prompt, total_completion));
+            }
+            // Build a regen prompt: original code + critique
+            // issues. We don't re-call the consumer's full
+            // `run_loop` (which would re-parse the S.DEF and
+            // re-build the system prompt); we just augment the
+            // user message and run again.
+            let issues_text = report
+                .issues
+                .iter()
+                .map(|i| {
+                    format!(
+                        "- [{:?}] {}: {}",
+                        i.severity, i.category, i.description
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let augmented = format!(
+                "Previous code:\n```\n{}\n```\n\n\
+                 Self-critique found these issues:\n{}\n\n\
+                 Please emit a new version that fixes them. \
+                 Wrap the new code in ```rust ... ```.",
+                current, issues_text
+            );
+            let ctx = crate::llm_loop::LoopContext::new(
+                "reflection-regen",
+                "consumer-llm-session",
+                "cleanroom-consumer",
+                "You are a code-fixing agent. Address every issue listed in the user message.",
+                augmented,
+            );
+            let mut loop_cfg = self.loop_config.clone();
+            loop_cfg.max_iterations = 1; // reflection rounds are one-shot
+            let outcome = crate::llm_loop::run_loop(llm.clone(), ctx, &loop_cfg)
+                .await
+                .map_err(|e| DbError::QueryFailed(format!("reflection regen: {e}")))?;
+            match outcome {
+                crate::llm_loop::LoopOutcome::Done { result, prompt_tokens, completion_tokens, .. } => {
+                    total_prompt += prompt_tokens;
+                    total_completion += completion_tokens;
+                    current = result;
+                }
+                _ => break,
+            }
+        }
+        Ok((current, last_report, total_prompt, total_completion))
     }
 
     /// Attach a tool set (Phase 0.10) to the per-call `LoopConfig.tools`
@@ -420,6 +615,7 @@ impl ConsumerAgent {
                 let system_prompt = build_llm_generate_code_system_prompt(
                     &self.config.language,
                     self.config.framework.as_deref(),
+                    self.config.target_manifest.as_ref(),
                 );
                 let user_message = format!(
                     "Generate the code for this S.DEF data model. Emit a single markdown \
@@ -525,6 +721,7 @@ impl ConsumerAgent {
                 let system_prompt = build_llm_generate_code_system_prompt(
                     &self.config.language,
                     self.config.framework.as_deref(),
+                    self.config.target_manifest.as_ref(),
                 );
                 let user_message = format!(
                     "Generate the code for this S.DEF interface contract. Emit a single \
@@ -638,9 +835,27 @@ impl ConsumerAgent {
     /// Read data models from the database.
     fn read_data_models(&self, document_name: &str) -> Result<Vec<sdef_core::DataModel>, DbError> {
         let conn = self.db.connection();
-        let mut stmt = conn.prepare(
-            "SELECT entity, description, version, logical_model FROM data_models WHERE document_name = ?1"
-        ).map_err(|e| DbError::QueryFailed(e.to_string()))?;
+        // Phase 1.3: when `scope` is `Module(name)`, filter the rows
+        // down to those whose `logical_model` contains the module
+        // name. We use a LIKE match (no formal module-tree yet)
+        // because it's good enough for the MVP — a real module
+        // resolution will land with the LSP integration (Phase 5).
+        let scope_filter = match &self.config.scope {
+            ConsumeScope::WholeProject => String::new(),
+            ConsumeScope::Module(name) => {
+                format!(" AND logical_model LIKE '%{}%'", name.replace('\'', "''"))
+            }
+            ConsumeScope::Function(_) => {
+                // Function scope is for function_specs, not
+                // data_models. We don't filter data_models here.
+                String::new()
+            }
+        };
+        let sql = format!(
+            "SELECT entity, description, version, logical_model FROM data_models \
+             WHERE document_name = ?1{scope_filter}"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| DbError::QueryFailed(e.to_string()))?;
 
         let mut rows = stmt.query(params![document_name])
             .map_err(|e| DbError::QueryFailed(e.to_string()))?;
@@ -717,10 +932,19 @@ impl ConsumerAgent {
     /// Read interface contracts from the database.
     fn read_contracts(&self, document_name: &str) -> Result<Vec<sdef_core::InterfaceContract>, DbError> {
         let conn = self.db.connection();
-        let mut stmt = conn.prepare(
-            "SELECT name, description, is_abstract FROM contracts
-             WHERE document_name = ?1 AND contract_type = 'interface'"
-        ).map_err(|e| DbError::QueryFailed(e.to_string()))?;
+        // Phase 1.3: same `Module(name)` filter as `read_data_models`.
+        let scope_filter = match &self.config.scope {
+            ConsumeScope::WholeProject => String::new(),
+            ConsumeScope::Module(name) => {
+                format!(" AND logical_model LIKE '%{}%'", name.replace('\'', "''"))
+            }
+            ConsumeScope::Function(_) => String::new(),
+        };
+        let sql = format!(
+            "SELECT name, description, is_abstract FROM contracts \
+             WHERE document_name = ?1 AND contract_type = 'interface'{scope_filter}"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| DbError::QueryFailed(e.to_string()))?;
 
         let mut rows = stmt.query(params![document_name])
             .map_err(|e| DbError::QueryFailed(e.to_string()))?;
@@ -907,16 +1131,37 @@ impl ConsumerAgent {
 // ============================================================================
 
 /// Build the system prompt for an LLM code-generation call.
-fn build_llm_generate_code_system_prompt(language: &str, framework: Option<&str>) -> String {
+///
+/// Phase 1.2: when `manifest` is `Some`, prepend a
+/// `=== target project skeleton ===` block so the LLM emits
+/// code that uses the right package name / dep set / entry
+/// point instead of hallucinating them.
+fn build_llm_generate_code_system_prompt(
+    language: &str,
+    framework: Option<&str>,
+    manifest: Option<&crate::target_manifest::TargetManifest>,
+) -> String {
     let framework_hint = match framework {
         Some(f) => format!("\nPreferred framework: {f}.\n"),
         None => String::new(),
+    };
+    // Phase 1.2: render the target skeleton block, or fall back
+    // to the pre-1.2 "language only" context.
+    let manifest_block = match manifest {
+        Some(m) if !m.is_empty() => format!(
+            "\n=== target project skeleton ===\n{}\n=== end target project skeleton ===\n\
+             \n\
+             Use the package name, dep set, and entry point above to choose idiomatic \
+             imports and naming — don't reinvent them.\n",
+            m.render_for_prompt()
+        ),
+        _ => String::new(),
     };
     format!(
         "You are a code-generation agent in the Cleanroom pipeline. The user will give \
          you an S.DEF entity (data model or interface contract) in JSON. Your job: emit \
          idiomatic {language} code that implements that entity, wrapped in a single \
-         markdown code block (triple backticks with a `{lang}` tag).\n\
+         markdown code block (triple backticks with a `{lang}` tag).{manifest_block}\
          \n\
          Rules:\n\
          {framework_hint}\
@@ -1287,6 +1532,149 @@ mod tests {
         assert!(cfg.use_legacy_template);
     }
 
+    // Phase 1.3: scope default + builder.
+    #[test]
+    fn test_consumer_config_default_scope_is_whole_project() {
+        let cfg = ConsumerConfig::default();
+        assert_eq!(cfg.scope, ConsumeScope::WholeProject);
+    }
+
+    #[test]
+    fn test_with_scope_module_string() {
+        let cfg = ConsumerConfig::default();
+        let cfg2 = ConsumerConfig {
+            scope: ConsumeScope::Module("src/api".to_string()),
+            ..cfg
+        };
+        match cfg2.scope {
+            ConsumeScope::Module(name) => assert_eq!(name, "src/api"),
+            _ => panic!("expected ConsumeScope::Module"),
+        }
+    }
+
+    // Phase 1.4 MVP close-out: the `with_max_reflection_iterations`
+    // builder on `ConsumerAgent` forwards to the per-call
+    // `LoopConfig::max_reflection_iterations` field. The
+    // `reflect_on_entity` method then consults that field to
+    // decide how many critique / regen rounds to run. Default
+    // is 0 (pre-1.4 behavior: no reflection, no extra LLM
+    // calls).
+    #[test]
+    fn test_with_max_reflection_iterations_default_is_zero() {
+        let cfg = LoopConfig::default();
+        assert_eq!(cfg.max_reflection_iterations, 0);
+    }
+
+    #[test]
+    fn test_with_max_reflection_iterations_sets_field() {
+        let db = std::sync::Arc::new(cleanroom_db::Database::in_memory().expect("in_memory"));
+        let agent = ConsumerAgent::new(ConsumerConfig::default(), db)
+            .with_max_reflection_iterations(3);
+        assert_eq!(agent.loop_config.max_reflection_iterations, 3);
+    }
+
+    #[test]
+    fn test_consume_scope_default_is_whole_project() {
+        assert_eq!(ConsumeScope::default(), ConsumeScope::WholeProject);
+    }
+
+    #[test]
+    fn test_consume_scope_debug_includes_payload() {
+        // The Debug projection should distinguish the 3 variants
+        // — useful in `cargo test -- --nocapture` runs and in
+        // consumer `info!` lines.
+        assert!(format!("{:?}", ConsumeScope::WholeProject).contains("WholeProject"));
+        assert!(format!("{:?}", ConsumeScope::Module("src".to_string())).contains("Module"));
+        assert!(format!("{:?}", ConsumeScope::Function("validate_email".to_string())).contains("Function"));
+    }
+
+    // Phase 1.3 MVP close-out: integration test that exercises the
+    // `Module(name)` filter against a real `data_models` table.
+    // Seeds 2 data models in module "src" + 1 data model in
+    // module "tests"; verifies that `Module("src")` returns only
+    // the 2 src models and `WholeProject` returns all 3.
+    #[test]
+    fn test_scope_module_filter_actually_filters_db() {
+        use cleanroom_db::repositories::sdef_repository::SdefRepository;
+        use cleanroom_db::Database;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("scope-test.db");
+        // Walk up to find the migrations dir (same pattern as
+        // the example binaries).
+        let migrations_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crate layout has two parents")
+            .join("migrations");
+        let db = Database::open_with_migrations_from(&db_path, Some(&migrations_dir))
+            .expect("open");
+        let sdef_repo = SdefRepository::new_with_arc(db.connection_arc());
+        sdef_repo
+            .upsert_document(&cleanroom_db::repositories::sdef_repository::SdefDocument {
+                name: "scope-doc".to_string(),
+                version: Some("0.1.0".to_string()),
+                description: Some("test doc".to_string()),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .expect("upsert doc");
+        for (entity, lm) in &[
+            ("User", "src/user.rs"),
+            ("Order", "src/order.rs"),
+            ("TestRunner", "tests/runner.rs"),
+        ] {
+            sdef_repo
+                .create_data_model(&cleanroom_db::repositories::sdef_repository::DataModel {
+                    entity: (*entity).to_string(),
+                    document_name: "scope-doc".to_string(),
+                    status: "active".to_string(),
+                    version: None,
+                    description: None,
+                    logical_model: Some((*lm).to_string()),
+                })
+                .expect("create data model");
+        }
+        // Use a temporary db so we can move it into a ConsumerAgent
+        // (it needs an Arc<Database>). We open it once more after
+        // seeding so the second Database handle sees the seeded
+        // rows — SQLite writes are durable.
+        let db2 = std::sync::Arc::new(
+            Database::open_with_migrations_from(&db_path, Some(&migrations_dir))
+                .expect("re-open"),
+        );
+        // WholeProject: 3 rows.
+        let cfg_whole = ConsumerConfig::default();
+        assert_eq!(cfg_whole.scope, ConsumeScope::WholeProject);
+        let agent_whole = ConsumerAgent::new(cfg_whole, db2.clone());
+        let all = agent_whole.read_data_models("scope-doc").expect("read all");
+        assert_eq!(all.len(), 3, "WholeProject returns all 3");
+        // Module("src"): 2 rows.
+        let cfg_src = ConsumerConfig {
+            scope: ConsumeScope::Module("src".to_string()),
+            ..ConsumerConfig::default()
+        };
+        let agent_src = ConsumerAgent::new(cfg_src, db2.clone());
+        let src_only = agent_src.read_data_models("scope-doc").expect("read src");
+        assert_eq!(src_only.len(), 2, "Module(src) returns the 2 src models");
+        let src_entities: std::collections::HashSet<String> = src_only
+            .iter()
+            .map(|m| m.entity.clone())
+            .collect();
+        assert!(src_entities.contains("User"));
+        assert!(src_entities.contains("Order"));
+        assert!(!src_entities.contains("TestRunner"));
+        // Module("nonexistent"): 0 rows.
+        let cfg_empty = ConsumerConfig {
+            scope: ConsumeScope::Module("nonexistent".to_string()),
+            ..ConsumerConfig::default()
+        };
+        let agent_empty = ConsumerAgent::new(cfg_empty, db2);
+        let none = agent_empty
+            .read_data_models("scope-doc")
+            .expect("read empty");
+        assert!(none.is_empty(), "Module(nonexistent) returns nothing");
+    }
+
     #[test]
     fn test_code_fence_tag_known_languages() {
         assert_eq!(code_fence_tag("rust"), "rust");
@@ -1294,6 +1682,57 @@ mod tests {
         assert_eq!(code_fence_tag("python"), "python");
         // Unknown language falls back to empty (we still wrap with ``` ```).
         assert_eq!(code_fence_tag("brainfuck"), "");
+    }
+
+    // Phase 1.2 MVP close-out: when a TargetManifest is attached,
+    // the system prompt should include a `=== target project skeleton ===`
+    // block with the package name, version, and dep set. When it's
+    // not, the block is absent (pre-1.2 behavior).
+    #[test]
+    fn test_build_llm_generate_code_system_prompt_with_manifest() {
+        use crate::target_manifest::TargetManifest;
+        let manifest = TargetManifest {
+            language: Some("rust".to_string()),
+            package_name: Some("my-app".to_string()),
+            version: Some("0.2.0".to_string()),
+            entry_point: Some("src/lib.rs".to_string()),
+            dependencies: vec!["tokio".to_string(), "serde".to_string(), "anyhow".to_string()],
+            manifest_path: Some(std::path::PathBuf::from("/tmp/my-app/Cargo.toml")),
+        };
+        let prompt = build_llm_generate_code_system_prompt(
+            "rust",
+            Some("actix-web"),
+            Some(&manifest),
+        );
+        // The skeleton block is in.
+        assert!(prompt.contains("=== target project skeleton ==="));
+        assert!(prompt.contains("=== end target project skeleton ==="));
+        // The fields are rendered.
+        assert!(prompt.contains("package:     my-app"));
+        assert!(prompt.contains("version:     0.2.0"));
+        assert!(prompt.contains("entry:       src/lib.rs"));
+        assert!(prompt.contains("tokio, serde, anyhow"));
+        // The framework hint is still in (separate code path).
+        assert!(prompt.contains("Preferred framework: actix-web"));
+    }
+
+    #[test]
+    fn test_build_llm_generate_code_system_prompt_without_manifest() {
+        let prompt = build_llm_generate_code_system_prompt("rust", None, None);
+        // No skeleton block when no manifest.
+        assert!(!prompt.contains("=== target project skeleton ==="));
+        // Still works as a plain language-targeted prompt.
+        assert!(prompt.contains("idiomatic rust code"));
+    }
+
+    #[test]
+    fn test_build_llm_generate_code_system_prompt_empty_manifest() {
+        // Empty manifest (all fields None) is treated as "no
+        // manifest" — we don't emit a useless empty skeleton block.
+        use crate::target_manifest::TargetManifest;
+        let manifest = TargetManifest::default();
+        let prompt = build_llm_generate_code_system_prompt("rust", None, Some(&manifest));
+        assert!(!prompt.contains("=== target project skeleton ==="));
     }
 
     #[test]

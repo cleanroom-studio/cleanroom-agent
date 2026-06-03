@@ -368,6 +368,11 @@ pub fn write_parsed_to_db(
             decision,
             rationale,
             context: None,
+            // Per-file decisions don't belong to a module —
+            // they're observations of one file. Leave NULL so
+            // `sdef_context::load_module_design_decisions` can
+            // filter them out cleanly.
+            module_name: None,
             alternatives_json: None,
             consequences_json: None,
         })?;
